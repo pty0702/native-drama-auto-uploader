@@ -101,26 +101,37 @@ def log(message: str) -> None:
             pass
 
 
-async def save_screenshot(page: Page, name: str, full_page: bool = True) -> None:
+async def save_screenshot(page: Page, name: str, full_page: bool = False) -> None:
+    """截图保存到 debug 目录。默认关闭 full_page 避免复杂页面超时。"""
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
     path = DEBUG_DIR / name
-    await page.screenshot(path=str(path), full_page=full_page)
-    log(f"截图: {path}")
+    try:
+        await page.screenshot(path=str(path), full_page=full_page, timeout=15000)
+        log(f"截图: {path}")
+    except Exception as exc:
+        log(f"截图失败({name}): {exc}")
 
 
 async def save_error(page: Page, step_name: str, exc: BaseException) -> None:
-    await save_screenshot(page, "native_drama_error.png")
-    state = {
-        "step_name": step_name,
-        "url": page.url,
-        "title": await page.title(),
-        "error": str(exc),
-        "traceback": traceback.format_exc(),
-    }
-    (DEBUG_DIR / "native_drama_error_state.json").write_text(
-        json.dumps(state, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    """保存错误截图和状态，截图失败不影响错误上报。"""
+    try:
+        await save_screenshot(page, "native_drama_error.png")
+    except Exception:
+        log("错误截图保存失败")
+    try:
+        state = {
+            "step_name": step_name,
+            "url": page.url,
+            "title": await page.title(),
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+        (DEBUG_DIR / "native_drama_error_state.json").write_text(
+            json.dumps(state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as save_exc:
+        log(f"错误状态保存失败: {save_exc}")
 
 
 async def settle_page(page: Page, timeout: int = 6000, require_networkidle: bool = False) -> None:
@@ -381,8 +392,11 @@ async def agree_terms(page: Page) -> None:
 
 async def dump_page_state(page: Page, prefix: str) -> None:
     await save_screenshot(page, f"{prefix}_full.png")
-    text = await page.locator("body").first.inner_text(timeout=5000)
-    (DEBUG_DIR / f"{prefix}_visible_text.txt").write_text(text, encoding="utf-8")
+    try:
+        text = await page.locator("body").first.inner_text(timeout=5000)
+        (DEBUG_DIR / f"{prefix}_visible_text.txt").write_text(text, encoding="utf-8")
+    except Exception as exc:
+        log(f"dump_page_state 获取文本失败: {exc}")
 
 
 class WeChatNativeDramaUploader:
@@ -395,27 +409,58 @@ class WeChatNativeDramaUploader:
     async def run_task(self, task: NativeDramaTask) -> None:
         DEBUG_DIR.mkdir(parents=True, exist_ok=True)
         executable_path = _resolve_chromium_path()
-        async with async_playwright() as playwright:
-            self.browser = await playwright.chromium.launch(
-                headless=self.config.headless,
-                slow_mo=self.config.browser_slow_mo_ms or None,
-                executable_path=executable_path,
-            )
-            self.context = await self.browser.new_context(storage_state=self.config.account_state_path)
-            await self.context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
-            self.page = await self.context.new_page()
-            try:
-                await self.open_step1()
-                await self.fill_step1(task)
-                await self.click_next()
-                await dump_page_state(self.page, "native_drama_step2")
-                await self.upload_step2(task)
-            except Exception as exc:
-                await save_error(self.page, "run_task", exc)
-                raise
-            finally:
-                await self.context.close()
-                await self.browser.close()
+        # 总超时：上传超时 + 10分钟缓冲（用于表单填写等）
+        overall_timeout = self.config.upload_timeout_min * 60 + 600
+        try:
+            async with async_playwright() as playwright:
+                self.browser = await playwright.chromium.launch(
+                    headless=self.config.headless,
+                    slow_mo=self.config.browser_slow_mo_ms or None,
+                    executable_path=executable_path,
+                )
+                self.context = await self.browser.new_context(storage_state=self.config.account_state_path)
+                await self.context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+                self.page = await self.context.new_page()
+                try:
+                    log(f"开始上传任务: {task.drama_name} ({task.episode_count}集), 总超时: {overall_timeout}s")
+                    await asyncio.wait_for(
+                        self._do_upload(task),
+                        timeout=overall_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    log(f"上传任务总超时({overall_timeout}s)，强制结束")
+                    raise RuntimeError(f"上传任务超时({overall_timeout // 60}分钟)，请检查网络和页面状态")
+                except Exception as exc:
+                    await save_error(self.page, "run_task", exc)
+                    raise
+                finally:
+                    try:
+                        await self.context.close()
+                    except Exception:
+                        pass
+                    try:
+                        await self.browser.close()
+                    except Exception:
+                        pass
+        except Exception as exc:
+            # 确保异常信息清晰
+            error_msg = str(exc)
+            if not error_msg:
+                error_msg = f"上传失败({type(exc).__name__})"
+            log(f"上传任务失败: {error_msg}")
+            raise RuntimeError(error_msg) from exc
+
+    async def _do_upload(self, task: NativeDramaTask) -> None:
+        """实际的上传流程，由 run_task 包裹超时和错误处理。"""
+        await self.open_step1()
+        log("步骤1: 页面已打开，开始填写表单")
+        await self.fill_step1(task)
+        log("步骤1: 表单填写完成")
+        await self.click_next()
+        await dump_page_state(self.page, "native_drama_step2")
+        log("步骤2: 开始上传视频")
+        await self.upload_step2(task)
+        log("上传任务全部完成")
 
     async def open_step1(self) -> None:
         assert self.page is not None
@@ -584,64 +629,72 @@ class WeChatNativeDramaUploader:
         page = self.page
         deadline = asyncio.get_running_loop().time() + self.config.upload_timeout_min * 60
         stuck_count = 0
+        poll_interval = min(self.config.upload_poll_min * 60, 60)  # 轮询最多60秒一次
+        poll_count = 0
         while asyncio.get_running_loop().time() < deadline:
+            poll_count += 1
+            # 截图用于诊断，失败不影响流程
             await save_screenshot(page, "step2_upload_poll.png")
             # 用 JS 获取全部可见文本（包括动态加载、iframe、shadow DOM 内容）
-            text = await page.evaluate("""
-                () => {
-                    // 获取 body 文本
-                    let result = document.body?.innerText || '';
-                    // 遍历所有 iframe
-                    document.querySelectorAll('iframe').forEach(iframe => {
-                        try {
-                            const doc = iframe.contentDocument || iframe.contentWindow?.document;
-                            if (doc && doc.body) result += '\\n' + doc.body.innerText;
-                        } catch(e) {}
-                    });
-                    // 遍历所有 shadow roots
-                    const walk = (node) => {
-                        if (node.shadowRoot) {
-                            result += '\\n' + (node.shadowRoot.innerText || node.shadowRoot.textContent || '');
-                            node.shadowRoot.childNodes.forEach(walk);
-                        }
-                        node.childNodes.forEach(walk);
-                    };
-                    try { document.body.childNodes.forEach(walk); } catch(e) {}
-                    return result;
-                }
-            """)
+            try:
+                text = await page.evaluate("""
+                    () => {
+                        let result = document.body?.innerText || '';
+                        document.querySelectorAll('iframe').forEach(iframe => {
+                            try {
+                                const doc = iframe.contentDocument || iframe.contentWindow?.document;
+                                if (doc && doc.body) result += '\\n' + doc.body.innerText;
+                            } catch(e) {}
+                        });
+                        const walk = (node) => {
+                            if (node.shadowRoot) {
+                                result += '\\n' + (node.shadowRoot.innerText || node.shadowRoot.textContent || '');
+                                node.shadowRoot.childNodes.forEach(walk);
+                            }
+                            node.childNodes.forEach(walk);
+                        };
+                        try { document.body.childNodes.forEach(walk); } catch(e) {}
+                        return result;
+                    }
+                """, timeout=10000)
+            except Exception as exc:
+                log(f"获取页面文本失败: {exc}")
+                await page.wait_for_timeout(poll_interval * 1000)
+                continue
             # 也尝试从所有 frame 中获取文本
             for frame in page.frames:
                 try:
                     frame_text = await frame.evaluate(
-                        "() => document.body?.innerText || ''"
+                        "() => document.body?.innerText || ''", timeout=5000
                     )
                     if frame_text and len(frame_text) > len(text):
                         text = frame_text
                 except Exception:
                     pass
-            # 保存页面文本 + URL + HTML 用于诊断
-            (DEBUG_DIR / "step2_poll_text.txt").write_text(
-                f"URL: {page.url}\n\n{text}", encoding="utf-8"
-            )
+            # 保存页面文本用于诊断
             try:
-                html = await page.content()
+                (DEBUG_DIR / "step2_poll_text.txt").write_text(
+                    f"URL: {page.url}\n\n{text}", encoding="utf-8"
+                )
+            except Exception:
+                pass
+            try:
+                html = await page.content(timeout=10000)
                 (DEBUG_DIR / "step2_poll.html").write_text(html, encoding="utf-8")
             except Exception:
                 pass
             compact = re.sub(r"\s+", "", text)
-            log(f"第二步轮询 URL: {page.url}, 文本长度: {len(text)}")
+            log(f"第 {poll_count} 次轮询 | URL: {page.url} | 文本长度: {len(text)}")
             upload_progress = re.search(r"已上传成功\s*(\d+)\s*/\s*(\d+)\s*集", text)
             if upload_progress:
                 done = int(upload_progress.group(1))
                 expected = int(upload_progress.group(2))
-                log(f"第二步上传进度: {done}/{expected}")
+                log(f"上传进度: {done}/{expected}")
                 if done == expected == total:
-                    log(f"第二步: 已上传成功 {done}/{expected} 集，准备确认提审")
+                    log(f"全部上传成功 {done}/{expected} 集，准备确认提审")
                     return
             else:
-                # 没匹配到任何模式，打印前300字
-                log(f"第二步页面文本(前300): {text[:300]}")
+                log(f"未匹配到进度(前200): {text[:200]}")
             # 检测是否卡在 0/N（上传没触发），连续3次就报错
             if compact.startswith("0/") or "0/" in compact[:10]:
                 stuck_count += 1
@@ -652,8 +705,8 @@ class WeChatNativeDramaUploader:
                     )
             else:
                 stuck_count = 0
-            await page.wait_for_timeout(self.config.upload_poll_min * 60 * 1000)
-        raise TimeoutError(f"等待视频上传完成超时: {total}/{total}")
+            await page.wait_for_timeout(poll_interval * 1000)
+        raise TimeoutError(f"等待视频上传完成超时({self.config.upload_timeout_min}分钟): {total}集")
 
     async def confirm_submit(self) -> None:
         assert self.page is not None

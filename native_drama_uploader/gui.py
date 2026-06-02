@@ -88,7 +88,9 @@ class UploadThread(threading.Thread):
             asyncio.run(run_next_task(dry_run=False))
             self.signals.upload_finished.emit("上传任务完成")
         except Exception as exc:
-            self.signals.upload_failed.emit(str(exc))
+            import traceback
+            error_detail = f"{exc}\n\n{traceback.format_exc()}"
+            self.signals.upload_failed.emit(error_detail)
 
 
 class LoginThread(threading.Thread):
@@ -1126,7 +1128,8 @@ class MainWindow(QMainWindow):
             self.upload_timer.start(interval_min * 60 * 1000)
 
     def on_upload_failed(self, msg: str) -> None:
-        self.append_log(f"上传失败: {msg}")
+        self.append_log(f"上传失败: {msg[:500]}")
+        self.btn_generate.setEnabled(True)
         self.refresh_table()
         # 失败了也继续下一条
         if self.store.next_pending():
