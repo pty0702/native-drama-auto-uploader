@@ -1,243 +1,135 @@
-# 微信视频号短剧自动上传队列
+# ReCreate AI - 微信视频号短剧批量生成上传工具
 
-这是一个全新项目，不修改以下旧项目：
+ReCreate AI 用于把微短剧素材批量整理成标准成品包，并自动进入微信视频号「上架剧集」流程。
 
-- `G:\python_file\ai_manju5.27`
-- `G:\python_file\social-auto-upload`
-
-目标是把 `ai_manju5.27` 生成的短剧成品文件夹加入上传队列，然后由本项目定时或手动上传到微信视频号助手的【收入与服务 -> 剧集管理 -> 上架剧集】流程。
-
-## 成品文件夹规范
-
-每个短剧文件夹建议包含：
+## 目录结构
 
 ```text
-短剧名/
-  第1集.mp4
-  第2集.mp4
-  ...
-  简介.txt
-  海报.jpg
-  模版.jpg
-  若干证明图片.jpg
+D:\ReCreate AI\
+├── ReCreate AI.exe
+├── README.md
+├── sucai\
+├── ffmpeg\bin\
+├── cookies\tencent_uploader\
+├── db\
+└── debug\
 ```
 
-自动识别规则：
+## 公共素材
 
-- 剧目名称：文件夹名
-- 剧目简介：优先读取 `简介.txt`
-- 总集数：统计 `.mp4/.mov/.m4v`
-- 试看集数：默认 `5`，GUI 可改
-- 制作成本：默认 `1`
-- 海报：优先 `海报.jpg`
-- 成本模板：优先 `模版.jpg` / `模板.jpg`
-- 制作证明材料：除海报和模板外，优先选择文件名包含 `剪影/截图/证明/制作/合同` 的图片，最多 4 张
-
-## 已集成能力
-
-本项目现在包含两条流程：
-
-1. 短剧成品生成流程，来自 `ai_manju5.27` 的核心能力：
-   - 扫描源素材文件夹
-   - 读取 TXT 简介
-   - 调用大模型生成新简介和短剧名
-   - 转码/重命名视频
-   - 处理海报
-   - 生成成本配置模板
-   - 输出标准成品文件夹
-   - 自动加入上传队列
-
-2. 微信视频号短剧上传流程：
-   - 扫码登录并保存登录态
-   - 填写【上架剧集】第一页
-   - 上传视频
-   - 每 3 分钟检查一次进度
-   - 全部上传完成后确认提审
-
-## 安装
-
-本机已按 Python 3.11 创建好虚拟环境：
+下面三个文件必须放在 `sucai` 根目录，不要放进每个视频包：
 
 ```text
-G:\python_file\native_drama_auto_uploader\.venv
+D:\ReCreate AI\sucai\视频.docx
+D:\ReCreate AI\sucai\模板.jpg
+D:\ReCreate AI\sucai\照片参考.png
 ```
 
-Python 版本：
+## 原始视频包
+
+每部短剧放在 `sucai` 下单独一个文件夹。海报不要叫“海报”，必须和文件夹同名。
+
+示例：
 
 ```text
-Python 3.11.9
+D:\ReCreate AI\sucai\婚后失忆\
+├── 第1集.mp4
+├── 第2集.mp4
+├── 婚后失忆.jpg
+├── 简介.txt
+├── 任意名称1.bmp
+├── 任意名称2.bmp
+├── 任意名称3.bmp
+└── 任意名称4.bmp
 ```
 
-如需在其他机器重新安装：
+要求：
 
-```powershell
-cd G:\python_file\native_drama_auto_uploader
-py -3.11 -m venv .venv
-.\.venv\Scripts\pip.exe install -r requirements.txt
-.\.venv\Scripts\python.exe -m patchright install chromium
-```
+- 视频：支持 `.mp4`、`.mov`、`.m4v`。
+- 简介：必须有 `.txt` 简介文件，生成后的短剧简介最多 100 字。
+- 海报：必须命名为“文件夹名”，例如文件夹叫 `婚后失忆`，海报就是 `婚后失忆.jpg/png/jpeg`。
+- 证明材料：源文件夹里放 `.bmp` 图片即可，软件会自动转成成品包里的 `证明1.jpg`、`证明2.jpg`、`证明3.jpg`、`证明4.jpg`，最多上传 4 张。
+- 原始视频包里不需要放 `视频.docx`、`模板.jpg`、`照片参考.png`、成本配置表。
 
-还需要系统 PATH 中可用：
+生成成功后，软件会删除原始导入的视频包，只保留生成后的成品文件夹。生成失败不会删除原始文件夹。
+
+## 成品包
+
+生成后的成品文件夹包含：
 
 ```text
-ffmpeg
-ffprobe
+成品短剧\
+├── 成品短剧-第1集.mp4
+├── 成品短剧-第2集.mp4
+├── 成品短剧.jpg
+├── 简介.txt
+├── 副名.txt
+├── 模版.jpg
+├── 证明1.jpg
+├── 证明2.jpg
+└── ...
 ```
 
-本机已检测可用。
+其中：
 
-## 登录态
+- `成品短剧.jpg` 是上传用海报。
+- `模版.jpg` 是自动生成的成本配置表照片。
+- 成本配置表会根据剧名、集数和总分钟数填写；不满 1 分钟按 1 分钟计算。
 
-本项目可以独立扫码登录并保存登录态，不依赖旧项目。
+同一天内，如果已经存在同名剧目并且处于待上传、上传中或已成功状态，软件会跳过该素材包，不转码、不入队，并在日志中记录原因。
 
-默认保存到：
+## ffmpeg
+
+交付包已内置 ffmpeg，只使用软件目录内的：
 
 ```text
-G:\python_file\native_drama_auto_uploader\cookies\tencent_uploader\account.json
+D:\ReCreate AI\ffmpeg\bin\ffmpeg.exe
+D:\ReCreate AI\ffmpeg\bin\ffprobe.exe
 ```
 
-首次使用请先扫码登录：
+不要依赖系统 PATH，也不需要客户额外配置。若误删 `ffmpeg` 文件夹，请重新解压交付包。
 
-```powershell
-cd G:\python_file\native_drama_auto_uploader
-.\.venv\Scripts\python.exe -m native_drama_uploader.cli login
-```
+## 使用步骤
 
-也可以打开 GUI 后点击【扫码登录】按钮。登录成功后会自动写入配置文件。
+1. 双击 `ReCreate AI.exe`。
+2. 填写卡密，点击「验证并保存」。授权不通过时，软件不能开始生成或上传。
+3. 点击「扫码登录」，用微信登录视频号助手。
+4. 在 `sucai` 根目录放好 `视频.docx`、`模板.jpg`、`照片参考.png`。
+5. 把每部短剧的原始视频包放进 `sucai`。
+6. 点击「添加素材包」，选择单个视频包，或选择 `sucai` 父目录批量导入。
+7. 填写文本 API Key 和生图 API Key。
+8. 点击「测试文本并保存」「测试生图并保存」，成功后会绿色提示，下次打开自动沿用。
+9. 点击「开始批量生成并上传」。
 
-## GUI 使用
+文本模型和生图模型由软件内置固定，客户不需要选择，也不能在界面修改。
 
-双击：
+## 授权卡密
+
+软件会连接授权服务器校验卡密、机器码、到期时间和封禁状态。开始生成和开始上传前都会验证一次；服务器明确返回无效、到期、封禁或设备不匹配时，流程会停止。
+
+默认授权服务器：`http://124.220.63.163:8787`。
+
+## 上传判断
+
+第二步上传视频后，软件每 2 分钟轮询一次页面。只有检测到底部出现：
 
 ```text
-启动界面.bat
+已上传成功 X/Y 集
 ```
 
-或命令行运行：
+并且 `X == Y == 当前视频总集数` 时，才会点击「确认提审」。
 
-```powershell
-cd G:\python_file\native_drama_auto_uploader
-.\.venv\Scripts\python.exe main.py
-```
+## 常见问题
 
-界面功能：
+**提示找不到 ffmpeg？**  
+重新解压交付包，确认 `软件目录\ffmpeg\bin\` 内存在 `ffmpeg.exe`、`ffprobe.exe` 和相关 `.dll` 文件。
 
-- 选择源素材文件夹，执行完整短剧生成流程
-- 设置 API Key、API 地址、文本模型、图像模型
-- 设置输出目录和成本模板原图
-- 生成完成后自动加入上传队列
-- 选择监控根目录，默认 `G:\python_file\ai_manju5.27`
-- 扫码登录并保存微信视频号助手登录态
-- 选择或修改登录态文件路径
-- 扫描根目录，把所有符合规范的成品文件夹加入队列
-- 手动选择单个成品文件夹加入队列
-- 设置制作方名称，并保存为默认
-- 设置试看集数，默认 `5`
-- 设置制作成本，默认 `1`
-- 设置是否上传完成后确认提审
-- 手动上传下一条任务
-- 定时上传下一条任务
+**扫码后仍然进不去？**  
+登录态可能过期，重新点击「扫码登录」。同时确认账号有视频号剧集上架权限。
 
-## CLI 使用
+**失败截图在哪里？**  
+失败截图、页面文本和运行日志在软件目录的 `debug` 文件夹。
 
-扫码登录可以双击：
+## 合规声明
 
-```text
-扫码登录.bat
-```
-
-解析一个成品文件夹，不加入队列、不上传：
-
-```powershell
-python -m native_drama_uploader.cli dry-run "G:\python_file\ai_manju5.27\骗失忆老公当员工"
-```
-
-加入队列：
-
-```powershell
-python -m native_drama_uploader.cli add "G:\python_file\ai_manju5.27\骗失忆老公当员工"
-```
-
-扫描根目录加入队列：
-
-```powershell
-python -m native_drama_uploader.cli scan --root "G:\python_file\ai_manju5.27"
-```
-
-查看队列：
-
-```powershell
-python -m native_drama_uploader.cli list
-```
-
-扫码登录并保存登录态：
-
-```powershell
-python -m native_drama_uploader.cli login
-```
-
-运行下一条任务：
-
-```powershell
-python -m native_drama_uploader.cli run-next
-```
-
-只验证下一条任务，不打开浏览器：
-
-```powershell
-python -m native_drama_uploader.cli run-next --dry-run
-```
-
-## 队列文件
-
-队列保存在：
-
-```text
-db/upload_queue.json
-```
-
-任务状态：
-
-- `pending`：等待上传
-- `uploading`：上传中
-- `success`：完成
-- `failed`：失败
-
-## 与 ai_manju5.27 联动
-
-第一阶段推荐用“扫描根目录”方式联动：
-
-1. `ai_manju5.27` 生成新短剧文件夹
-2. 本项目 GUI 定时扫描 `G:\python_file\ai_manju5.27`
-3. 新文件夹进入队列
-4. 定时上传器处理 pending 任务
-
-后续可以在 `ai_manju5.27/gui/main_window.py` 的生成完成处追加一条队列写入，这样生成完成后会立刻进入本项目队列。为了保持旧项目原样，本项目当前不直接修改它。
-
-## 上传行为
-
-当前上传器会执行：
-
-1. 打开 `https://channels.weixin.qq.com/platform/playlet`
-2. 点击【上架剧集】
-3. 填写第一页剧目信息
-4. 上传海报、推广海报、证明材料、成本模板
-5. 点击【下一步】
-6. 第二步选择全部视频文件
-7. 每 3 分钟检查一次上传进度
-8. 检测到 `已上传成功 N/N 集` 后，点击【确认提审】
-
-如果不想最终提审，可以在 GUI 取消勾选“上传完成后确认提审”，或者 CLI 使用 `--no-submit` 加入任务。
-
-## 调试文件
-
-截图和错误状态保存在：
-
-```text
-debug/
-```
-
-如果上传失败，优先查看：
-
-- `debug/native_drama_error.png`
-- `debug/native_drama_error_state.json`
+ReCreate AI 仅供合法合规用途。请确保素材、文字、图片、音乐、剧集内容均拥有合法版权或授权，使用本工具产生的相关责任由使用者自行承担。

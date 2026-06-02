@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .queue_store import QueueStore
 from .settings import load_config
+from .license_client import require_valid_license
 
 
 async def run_next_task(dry_run: bool = False) -> None:
@@ -20,6 +21,7 @@ async def run_next_task(dry_run: bool = False) -> None:
         return
 
     config = load_config()
+    require_valid_license(config)
     store.update(task.id, status="uploading", last_error="")
     try:
         from .uploader import WeChatNativeDramaUploader

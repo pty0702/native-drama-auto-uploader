@@ -10,9 +10,8 @@ from uuid import uuid4
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v"}
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp"}
-CONFIG_SUFFIXES = {".pdf", ".jpg", ".jpeg", ".png", ".bmp"}
-PROOF_KEYWORDS = ("剪影", "截图", "证明", "制作", "合同")
-CONFIG_KEYWORDS = ("配置表", "备案", "资质", "许可", "证明", "模版", "模板")
+CONFIG_SUFFIXES = {".pdf", ".jpg", ".jpeg", ".png", ".bmp", ".docx", ".doc"}
+CONFIG_KEYWORDS = ("配置表", "备案", "资质", "许可", "模版", "模板", "预算表")
 
 
 def now_iso() -> str:
@@ -60,7 +59,7 @@ def find_first_existing(folder: Path, names: tuple[str, ...], suffixes: set[str]
 def find_cover(folder: Path) -> Path | None:
     direct = find_first_existing(
         folder,
-        ("海报.jpg", "海报.jpeg", "海报.png", f"{folder.name}.jpg", f"{folder.name}.png"),
+        (f"{folder.name}.jpg", f"{folder.name}.jpeg", f"{folder.name}.png", "海报.jpg", "海报.jpeg", "海报.png"),
         IMAGE_SUFFIXES,
     )
     if direct:
@@ -92,17 +91,16 @@ def find_config_file(folder: Path, cover_path: Path | None = None) -> Path | Non
 
 
 def find_proof_images(folder: Path, cover_path: Path | None = None, config_path: Path | None = None) -> list[Path]:
-    images = [
+    proofs = [
         p
         for p in folder.iterdir()
         if p.is_file()
-        and p.suffix.lower() in IMAGE_SUFFIXES
+        and p.suffix.lower() in {".jpg", ".jpeg"}
+        and re.fullmatch(r"证明\d+", p.stem)
         and (cover_path is None or not same_path(p, cover_path))
         and (config_path is None or not same_path(p, config_path))
     ]
-    images = sorted(images, key=natural_key)
-    matched = [p for p in images if any(keyword in p.stem for keyword in PROOF_KEYWORDS)]
-    return (matched or images)[:4]
+    return sorted(proofs, key=natural_key)[:4]
 
 
 def find_description(folder: Path) -> str:
@@ -111,6 +109,14 @@ def find_description(folder: Path) -> str:
         if text:
             return text[:100]
     return f"《{folder.name}》讲述一段情节紧凑、反转不断的短剧故事，适合连续观看。"
+
+
+def find_drama_name(folder: Path) -> str:
+    for name in ("副名.txt", "剧名.txt", "标题.txt"):
+        text = read_text_if_exists(folder / name)
+        if text:
+            return text[:50]
+    return folder.name
 
 
 @dataclass
@@ -159,6 +165,9 @@ def build_task_from_folder(
     if not video_files:
         raise ValueError(f"成品文件夹里没有 mp4/mov/m4v 视频: {path}")
 
+    # 试看集数：>=1 且 < 总集数（单集剧试看=1）
+    trial_episodes = max(1, min(trial_episodes, len(video_files) - 1)) if len(video_files) > 1 else 1
+
     cover_path = find_cover(path)
     if not cover_path:
         raise FileNotFoundError(f"成品文件夹里没有找到海报图片: {path}")
@@ -168,7 +177,7 @@ def build_task_from_folder(
 
     return NativeDramaTask(
         folder=str(path),
-        drama_name=path.name,
+        drama_name=find_drama_name(path),
         description=find_description(path),
         video_files=[str(p) for p in video_files],
         cover_path=str(cover_path),

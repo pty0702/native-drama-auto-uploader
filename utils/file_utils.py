@@ -12,7 +12,7 @@ def find_files(folder, ext_set):
         ext = os.path.splitext(f)[1].lower()
         if ext in ext_set:
             result.append(os.path.join(folder, f))
-    return sorted(result)
+    return sorted(result, key=_natural_file_key)
 
 
 def find_txt(folder):
@@ -24,7 +24,11 @@ def find_txt(folder):
 
 def extract_episode_number(filename):
     name = os.path.splitext(os.path.basename(filename))[0]
-    m = re.search(r"第(\d+)集", name)
+    name = _normalize_digits(name)
+    m = re.search(r"第\s*(\d+)\s*[集话話回]", name)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(?:^|[^a-zA-Z])(?:EP|Ep|ep|E|e)\s*0*(\d+)(?:\D|$)", name)
     if m:
         return int(m.group(1))
     m = re.search(r"(\d+)", name)
@@ -33,11 +37,27 @@ def extract_episode_number(filename):
     return 0
 
 
+def _normalize_digits(value):
+    return value.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+
+
+def _natural_file_key(path):
+    basename = os.path.basename(path)
+    episode = extract_episode_number(basename)
+    normalized = _normalize_digits(basename).lower()
+    parts = re.split(r"(\d+)", normalized)
+    natural = [int(part) if part.isdigit() else part for part in parts]
+    return (0 if episode else 1, episode, natural)
+
+
 def get_video_duration(video_path):
     import subprocess
     try:
+        from core.video_processor import _get_ffprobe
+
+        ffprobe = _get_ffprobe()
         result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", video_path],
             capture_output=True, text=True, timeout=10
         )

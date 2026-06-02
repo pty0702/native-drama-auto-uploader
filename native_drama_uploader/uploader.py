@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import sys
 import traceback
 from pathlib import Path
 from typing import Any
@@ -16,12 +18,87 @@ except ImportError:
     from playwright.async_api import Browser, BrowserContext, Locator, Page, async_playwright
 
 
+def _resolve_chromium_path() -> str | None:
+    """Find the best available Chromium/Chrome executable on this machine.
+
+    Search order:
+    1. Playwright / Patchright cache  — ``%LOCALAPPDATA%\\ms-playwright``
+       (the exact version the driver expects, installed via
+       ``patchright install chromium`` or ``playwright install chromium``)
+    2. System Google Chrome
+    3. System Microsoft Edge (Chromium-based, present on most Windows 10+)
+
+    When running inside a PyInstaller bundle the driver looks for browsers
+    inside the temp extraction directory.  We set ``PLAYWRIGHT_BROWSERS_PATH``
+    to point at the real user cache so the cached version can be found.
+
+    Outside PyInstaller, returns ``None`` immediately — Playwright's default
+    browser resolution just works.
+
+    Returns the path to a chrome.exe / msedge.exe, or ``None``.
+    """
+    # Outside PyInstaller, let Playwright use its default behaviour
+    if not getattr(sys, "frozen", False):
+        return None
+
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+
+    # ---- 1. Playwright / Patchright cache --------------------------------
+    if local_app_data:
+        for cache_dir in ("ms-playwright", "patchright"):
+            cache_path = os.path.join(local_app_data, cache_dir)
+            if not os.path.isdir(cache_path):
+                continue
+            # Tell the driver to look here
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = cache_path
+            # Prefer the newest matching chromium build
+            for item in sorted(os.listdir(cache_path), reverse=True):
+                if not item.startswith("chromium-"):
+                    continue
+                exe = os.path.join(cache_path, item, "chrome-win64", "chrome.exe")
+                if os.path.isfile(exe):
+                    return exe
+
+    # ---- 2. System Google Chrome -----------------------------------------
+    for root in (os.environ.get("ProgramFiles", ""),
+                 os.environ.get("ProgramFiles(x86)", ""),
+                 local_app_data):
+        if not root:
+            continue
+        chrome = os.path.join(root, "Google", "Chrome", "Application", "chrome.exe")
+        if os.path.isfile(chrome):
+            return chrome
+
+    # ---- 3. System Microsoft Edge ----------------------------------------
+    for root in (os.environ.get("ProgramFiles(x86)", ""),
+                 os.environ.get("ProgramFiles", "")):
+        if not root:
+            continue
+        edge = os.path.join(root, "Microsoft", "Edge", "Application", "msedge.exe")
+        if os.path.isfile(edge):
+            return edge
+
+    return None
+
+
 PLAYLET_URL = "https://channels.weixin.qq.com/platform/playlet"
 NATIVE_DRAMA_POST_URL = "https://channels.weixin.qq.com/platform/native-drama-post"
 
 
 def log(message: str) -> None:
-    print(message, flush=True)
+    # 全部写入 debug 日志避免 GBK 终端乱码
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = DEBUG_DIR / "console.log"
+    with open(str(log_path), "a", encoding="utf-8") as f:
+        f.write(message + "\n")
+    # 尝试打印 ASCII 安全版本到终端
+    try:
+        print(message, flush=True)
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        try:
+            print(message.encode("ascii", errors="replace").decode("ascii"), flush=True)
+        except Exception:
+            pass
 
 
 async def save_screenshot(page: Page, name: str, full_page: bool = True) -> None:
@@ -130,6 +207,10 @@ async def safe_click(page: Page, candidates: list[dict[str, Any]], step_name: st
             return
         except Exception as exc:
             errors.append(f"{candidate}: {exc}")
+    # 所有候选都没找到或点击失败
+    if not errors:
+        await save_screenshot(page, f"safe_click_fail_{step_name}.png")
+        raise RuntimeError(f"{step_name}: 未找到任何匹配元素（已截图）")
     raise RuntimeError(f"{step_name}: 点击失败: {' | '.join(errors)}")
 
 
@@ -300,7 +381,7 @@ async def agree_terms(page: Page) -> None:
 
 async def dump_page_state(page: Page, prefix: str) -> None:
     await save_screenshot(page, f"{prefix}_full.png")
-    text = await page.locator("body").inner_text(timeout=5000)
+    text = await page.locator("body").first.inner_text(timeout=5000)
     (DEBUG_DIR / f"{prefix}_visible_text.txt").write_text(text, encoding="utf-8")
 
 
@@ -313,10 +394,12 @@ class WeChatNativeDramaUploader:
 
     async def run_task(self, task: NativeDramaTask) -> None:
         DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        executable_path = _resolve_chromium_path()
         async with async_playwright() as playwright:
             self.browser = await playwright.chromium.launch(
                 headless=self.config.headless,
                 slow_mo=self.config.browser_slow_mo_ms or None,
+                executable_path=executable_path,
             )
             self.context = await self.browser.new_context(storage_state=self.config.account_state_path)
             await self.context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
@@ -341,13 +424,17 @@ class WeChatNativeDramaUploader:
         if not account.exists():
             raise FileNotFoundError(f"登录态文件不存在: {account}")
         await page.goto(PLAYLET_URL)
-        await settle_page(page)
-        await wait_for_any_text(page, ("上架剧集", "剧集管理", "收入与服务"), timeout_ms=12000)
+        await settle_page(page, require_networkidle=True)
+        await wait_for_any_text(page, ("上架剧集", "剧集管理", "收入与服务"), timeout_ms=15000)
+        await page.wait_for_timeout(2000)
         await safe_click(
             page,
             [
                 {"kind": "role_button", "value": "上架剧集"},
                 {"kind": "css", "value": 'button:has-text("上架剧集")'},
+                {"kind": "css", "value": 'a:has-text("上架剧集")'},
+                {"kind": "css", "value": '[class*="btn"]:has-text("上架剧集")'},
+                {"kind": "css", "value": 'div:has-text("上架剧集")'},
                 {"kind": "text", "value": "上架剧集", "exact": True},
             ],
             "点击上架剧集",
@@ -403,10 +490,16 @@ class WeChatNativeDramaUploader:
             "点击下一步",
         )
         await settle_page(page)
-        try:
-            await wait_for_any_text(page, ("请选择要上传的视频文件", "选择文件", "确认提审"), timeout_ms=10000)
-        except Exception:
-            pass
+        # 检查是否还在 step1（页面还有"剧目名称"等字段说明没跳转）
+        # step1 的"选择文件"按钮会误导文本检测，改用字段存在性判断
+        body_text = await page.locator("body").first.inner_text(timeout=3000)
+        if "剧目名称" in body_text and "总集数" in body_text:
+            await dump_page_state(page, "step1_next_failed")
+            raise RuntimeError(
+                "点击下一步后仍在第一页（表单校验可能失败）。"
+                f"当前 URL: {page.url}"
+            )
+        log(f"已进入 step2，URL: {page.url}")
 
     async def upload_step2(self, task: NativeDramaTask) -> None:
         assert self.page is not None
@@ -428,8 +521,8 @@ class WeChatNativeDramaUploader:
                 try:
                     if not await target.is_visible(timeout=150):
                         continue
-                    async with page.expect_file_chooser(timeout=5000) as chooser_info:
-                        await target.click(timeout=3000)
+                    async with page.expect_file_chooser(timeout=15000) as chooser_info:
+                        await target.click(timeout=5000)
                     chooser = await chooser_info.value
                     await chooser.set_files(paths)
                     uploaded = True
@@ -490,18 +583,75 @@ class WeChatNativeDramaUploader:
         assert self.page is not None
         page = self.page
         deadline = asyncio.get_running_loop().time() + self.config.upload_timeout_min * 60
+        stuck_count = 0
         while asyncio.get_running_loop().time() < deadline:
             await save_screenshot(page, "step2_upload_poll.png")
-            text = await page.locator("body").inner_text(timeout=5000)
+            # 用 JS 获取全部可见文本（包括动态加载、iframe、shadow DOM 内容）
+            text = await page.evaluate("""
+                () => {
+                    // 获取 body 文本
+                    let result = document.body?.innerText || '';
+                    // 遍历所有 iframe
+                    document.querySelectorAll('iframe').forEach(iframe => {
+                        try {
+                            const doc = iframe.contentDocument || iframe.contentWindow?.document;
+                            if (doc && doc.body) result += '\\n' + doc.body.innerText;
+                        } catch(e) {}
+                    });
+                    // 遍历所有 shadow roots
+                    const walk = (node) => {
+                        if (node.shadowRoot) {
+                            result += '\\n' + (node.shadowRoot.innerText || node.shadowRoot.textContent || '');
+                            node.shadowRoot.childNodes.forEach(walk);
+                        }
+                        node.childNodes.forEach(walk);
+                    };
+                    try { document.body.childNodes.forEach(walk); } catch(e) {}
+                    return result;
+                }
+            """)
+            # 也尝试从所有 frame 中获取文本
+            for frame in page.frames:
+                try:
+                    frame_text = await frame.evaluate(
+                        "() => document.body?.innerText || ''"
+                    )
+                    if frame_text and len(frame_text) > len(text):
+                        text = frame_text
+                except Exception:
+                    pass
+            # 保存页面文本 + URL + HTML 用于诊断
+            (DEBUG_DIR / "step2_poll_text.txt").write_text(
+                f"URL: {page.url}\n\n{text}", encoding="utf-8"
+            )
+            try:
+                html = await page.content()
+                (DEBUG_DIR / "step2_poll.html").write_text(html, encoding="utf-8")
+            except Exception:
+                pass
             compact = re.sub(r"\s+", "", text)
-            if f"{total}/{total}" in compact:
-                log(f"第二步: 已上传成功 {total}/{total} 集")
-                return
-            match = re.search(r"已上传成功\s*(\d+)\s*/\s*(\d+)\s*集", text)
-            if match:
-                log(f"第二步上传进度: {match.group(1)}/{match.group(2)}")
+            log(f"第二步轮询 URL: {page.url}, 文本长度: {len(text)}")
+            upload_progress = re.search(r"已上传成功\s*(\d+)\s*/\s*(\d+)\s*集", text)
+            if upload_progress:
+                done = int(upload_progress.group(1))
+                expected = int(upload_progress.group(2))
+                log(f"第二步上传进度: {done}/{expected}")
+                if done == expected == total:
+                    log(f"第二步: 已上传成功 {done}/{expected} 集，准备确认提审")
+                    return
             else:
-                log("第二步上传进度: 未检测到完整进度")
+                # 没匹配到任何模式，打印前300字
+                log(f"第二步页面文本(前300): {text[:300]}")
+            # 检测是否卡在 0/N（上传没触发），连续3次就报错
+            if compact.startswith("0/") or "0/" in compact[:10]:
+                stuck_count += 1
+                if stuck_count >= 3:
+                    raise RuntimeError(
+                        f"上传进度连续 {stuck_count} 次为 0/{total}，视频上传可能未触发。"
+                        "请检查页面或重试。"
+                    )
+            else:
+                stuck_count = 0
             await page.wait_for_timeout(self.config.upload_poll_min * 60 * 1000)
         raise TimeoutError(f"等待视频上传完成超时: {total}/{total}")
 
