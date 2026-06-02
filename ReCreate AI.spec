@@ -21,13 +21,31 @@ for pkg in ("PIL", "lxml", "cryptography", "bcrypt",
     extra_datas += collect_data_files(pkg)
 
 all_hiddenimports = playwright_hiddenimports + extra_hiddenimports
-all_datas = [('app_icon.png', '.')] + playwright_datas + extra_datas
 
+# 数据文件：图标 + sucai 模板 + ffmpeg
+all_datas = [
+    ('app_icon.png', '.'),
+    ('sucai/视频.docx', 'sucai'),
+    ('sucai/模板.jpg', 'sucai'),
+    ('sucai/照片参考.png', 'sucai'),
+] + playwright_datas + extra_datas
+
+# 额外二进制：ffmpeg / ffprobe 及其 DLL
+import glob as _glob
+ffmpeg_binaries = []
+ffmpeg_dir = 'ffmpeg/bin'
+for ext in ('*.exe', '*.dll'):
+    for f in _glob.glob(f'{ffmpeg_dir}/{ext}'):
+        ffmpeg_binaries.append((f, 'ffmpeg/bin'))
+
+print(f"[SPEC] ffmpeg binaries: {len(ffmpeg_binaries)} files")
+print(f"[SPEC] hidden imports: {len(all_hiddenimports)} modules")
+print(f"[SPEC] datas: {len(all_datas)} entries")
 
 a = Analysis(
     ['main.py'],
-    pathex=[],
-    binaries=[],
+    pathex=['.'],
+    binaries=ffmpeg_binaries,
     datas=all_datas,
     hiddenimports=all_hiddenimports,
     hookspath=[],
