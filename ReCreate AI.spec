@@ -16,7 +16,8 @@ extra_datas = []
 for pkg in ("PIL", "lxml", "cryptography", "bcrypt",
             "pydantic_core", "charset_normalizer", "certifi",
             "fitz", "pymupdf", "docx2pdf", "openai", "httpx", "pydantic",
-            "win32com", "win32api", "win32con", "pythoncom", "pywintypes"):
+            "win32com", "win32api", "win32con", "pythoncom", "pywintypes",
+            "docx", "requests", "urllib3", "anyio", "httpcore"):
     extra_hiddenimports += collect_submodules(pkg)
     extra_datas += collect_data_files(pkg)
 

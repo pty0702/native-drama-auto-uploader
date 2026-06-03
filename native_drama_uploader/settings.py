@@ -26,7 +26,7 @@ DEFAULT_STAMP_IMAGE = SUCAI_DIR / "模板.jpg"
 
 # 默认 API 地址只预填服务地址，不预填任何 API Key。
 TEXT_API_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
-IMAGE_API_BASE_URL = "https://xmapi.site"
+IMAGE_API_BASE_URL = "https://aheapi.com"
 TEXT_MODEL = "doubao-seed-2-0-lite-260428"
 IMAGE_MODEL = "gpt-image-2"
 LICENSE_SERVER_URL = "http://124.220.63.163:8787"

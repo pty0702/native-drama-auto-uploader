@@ -4,13 +4,14 @@
 流程：
 1. 用 python-docx 在 视频.docx 模板中填入微短剧名称、集数和总时长
 2. 通过 Word COM → PDF → PyMuPDF 转 jpg
-3. 上半部分取 docx 图片，下半部分取 图2.jpg（印章区域）
-4. 拼合后发送 gpt-image-2 images/edits API，生成自然照片效果
+3. 将填好字的 docx 图片、带章模板图一起发送 images/edits API
+4. AI 按提示词融合生成一张真实打印纸放在桌面上的自然照片，作为最终模版.jpg
 """
 from __future__ import annotations
 
 import base64
 import math
+import mimetypes
 import os
 import random
 import shutil
@@ -92,24 +93,24 @@ def generate_template_image(
     log("步骤 2: 转换 docx 为图片...")
     docx_img = _docx_to_image(filled_docx)
 
-    # ---- 步骤 3: 和图2.jpg 融合 ----
-    log("步骤 3: 融合模板图片和印章图...")
-    merged_img = _merge_images(docx_img, stamp_image_path)
+    docx_image_path = os.path.join(output_dir, "_docx_filled_input.jpg")
+    docx_img.save(docx_image_path, "JPEG", quality=95)
+    log(f"  已保存填字后的 docx 图片: {docx_image_path}")
 
-    merged_path = os.path.join(output_dir, "_merged_input.jpg")
-    merged_img.save(merged_path, "JPEG", quality=95)
-    log(f"  融合图已保存: {merged_path}")
+    # 旧方案已停用：不再用 docx 上半部分 + 模板下半部分做本地拼接。
+    # merged_img = _merge_images(docx_img, stamp_image_path)
+    # merged_path = os.path.join(output_dir, "_merged_input.jpg")
+    # merged_img.save(merged_path, "JPEG", quality=95)
 
-    # docx 无法高保真渲染时，用完整模板图直接填写表格作为稳定输入。
-    stable_input = _fill_stamp_template(stamp_image_path, output_dir, sub_name, episode_count, total_min, log)
-    if stable_input:
-        merged_path = stable_input
+    # 旧兜底已停用：不再直接擦写 模板.jpg 的表格区域。
+    # stable_input = _fill_stamp_template(stamp_image_path, output_dir, sub_name, episode_count, total_min, log)
 
-    # ---- 步骤 4: AI 生成自然照片 ----
+    # ---- 步骤 3: AI 融合 docx 和印章模板 ----
     active_model = image_model or IMAGE_MODEL
-    log(f"步骤 4: 调用 AI({active_model}) 生成自然照片...")
-    ai_img = _ai_naturalize(
-        merged_path,
+    log(f"步骤 3: 调用 AI({active_model}) 融合 docx 和印章模板...")
+    ai_img = _ai_fuse_template_photo(
+        docx_image_path=docx_image_path,
+        stamp_image_path=stamp_image_path,
         sub_name=sub_name,
         episode_count=episode_count,
         total_min=total_min,
@@ -119,38 +120,39 @@ def generate_template_image(
         image_model=active_model,
         log_cb=log,
     )
-    if ai_img is not None:
-        ai_path = os.path.join(output_dir, "_ai_naturalized.jpg")
-        ai_img.save(ai_path, "JPEG", quality=95)
-        log(f"  AI 自然化图已保存为调试参考: {ai_path}")
-
     out_path = os.path.join(output_dir, "模版.jpg")
-    last_report = None
-    for attempt in range(1, max_attempts + 1):
-        log(f"步骤 5: 生成并审查最终图片({attempt}/{max_attempts})...")
-        final_img = _make_paper_photo(merged_path, seed=20260530 + attempt)
-        candidate_path = os.path.join(output_dir, f"_template_candidate_{attempt}.jpg")
-        final_img.save(candidate_path, "JPEG", quality=95)
-        ok, report = validate_template_image(
-            candidate_path,
-            sub_name=sub_name,
-            episode_count=episode_count,
-            total_min=total_min,
-        )
-        last_report = report
-        if ok:
-            shutil.copy2(candidate_path, out_path)
-            _cleanup_intermediate_files(output_dir)
-            log(f"  审查通过: {report}")
-            log(f"成本配置模板完成: {out_path}")
-            return out_path
-        log(f"  审查未通过: {report}")
+    candidate_path = os.path.join(output_dir, "_ai_fused_candidate.jpg")
+    ai_img = _ensure_min_report_size(ai_img)
+    ai_img.save(candidate_path, "JPEG", quality=95)
 
-    raise RuntimeError(f"成本配置模板生成后审查未通过: {last_report}")
+    # 旧本地照片化兜底已停用：AI 融合失败或审查失败时直接报错。
+    # final_img = _make_paper_photo(merged_path, seed=20260530 + attempt)
+    log("步骤 4: 审查 AI 融合最终图片...")
+    ok, report = validate_template_image(
+        candidate_path,
+        sub_name=sub_name,
+        episode_count=episode_count,
+        total_min=total_min,
+    )
+    if not ok:
+        raise RuntimeError(f"AI 融合成本配置模板审查未通过: {report}")
+
+    shutil.copy2(candidate_path, out_path)
+    _cleanup_intermediate_files(output_dir)
+    log(f"  审查通过: {report}")
+    log(f"成本配置模板完成: {out_path}")
+    return out_path
 
 
 def _cleanup_intermediate_files(output_dir: str) -> None:
-    for pattern in ("_merged_input.*", "_filled_template.*", "_template_candidate_*.*", "_ai_naturalized.*"):
+    for pattern in (
+        "_merged_input.*",
+        "_filled_template.*",
+        "_template_candidate_*.*",
+        "_ai_naturalized.*",
+        "_docx_filled_input.*",
+        "_ai_fused_candidate.*",
+    ):
         for path in Path(output_dir).glob(pattern):
             try:
                 path.unlink()
@@ -384,30 +386,28 @@ def _fill_docx(template_path: str | Path, sub_name: str, episode_count: int, tot
 # ============================================================
 
 def _docx_to_image(docx_path: str) -> Image.Image:
-    """将 docx 转为 PIL Image。优先 docx2pdf，失败则用 PIL 直接渲染。"""
+    """将 docx 转为 PIL Image。必须走 Word/docx2pdf，高保真失败就直接报错。"""
     pdf_path = docx_path.replace(".docx", ".pdf")
-    pdf_ok = False
 
-    # 方案 A: docx2pdf（需要 Word）
     try:
         from docx2pdf import convert
         convert(docx_path, pdf_path)
-        if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0:
-            pdf_ok = True
-    except Exception:
-        pass
+    except Exception as exc:
+        raise RuntimeError(f"docx 转 PDF 失败，请确认本机 Word/docx2pdf 可用: {exc}") from exc
 
-    if pdf_ok:
-        img = _pdf_to_image(pdf_path)
-        for p in [docx_path, pdf_path]:
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
-        return img
+    if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) <= 0:
+        raise RuntimeError("docx 转 PDF 失败：未生成有效 PDF")
 
-    # 方案 B: PIL 直接渲染（不需要 Word）
-    return _render_docx_as_image(docx_path)
+    img = _pdf_to_image(pdf_path)
+    for p in [docx_path, pdf_path]:
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+    return img
+
+    # 旧低保真兜底已停用：不再用 PIL 简易渲染 docx。
+    # return _render_docx_as_image(docx_path)
 
 
 def _render_docx_as_image(docx_path: str) -> Image.Image:
@@ -636,6 +636,132 @@ def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: int):
 # 步骤 4: AI 生成自然照片效果
 # ============================================================
 
+def _ai_fuse_template_photo(
+    docx_image_path: str,
+    stamp_image_path: str,
+    sub_name: str,
+    episode_count: int,
+    total_min: int,
+    company_name: str | None = None,
+    api_key: str | None = None,
+    api_base_url: str | None = None,
+    image_model: str | None = None,
+    log_cb=None,
+) -> Image.Image:
+    """用 AI 把 docx 内容和印章模板融合为一张真实纸质照片。"""
+    def log(msg):
+        if log_cb:
+            log_cb(msg)
+
+    api_key = api_key or ""
+    if not api_key:
+        raise RuntimeError("未配置图片 API Key，无法生成成本配置表")
+
+    api_base_url = _normalize_api_base_url(api_base_url)
+    image_model = image_model or IMAGE_MODEL
+    url = f"{api_base_url}/images/edits"
+
+    lq = "“"
+    rq = "”"
+    company_instruction = (
+        f"报审机构必须是：{company_name}。"
+        if company_name
+        else "报审机构按第二张带章模板图中的文字保留。"
+    )
+    prompt = (
+        "请把两张输入图融合成一张真实手机拍摄照片，不要拼接痕迹，不要覆盖痕迹。\n\n"
+        "输入图说明：\n"
+        "1. 第一张图是已经在 docx 中改好字的成本配置比例情况报告，必须作为正文、表格和剧目信息的唯一内容来源。\n"
+        "2. 第二张图是带红色圆形公章、方章、签名章和底部机构信息的模板图，底部印章、签名章、机构和日期只能来自这张图。\n\n"
+        "最终图要求：\n"
+        f"1. 输出是一整张完整白色 A4 打印纸，不是两张照片叠加，不是截图，不是扫描件。\n"
+        f"2. 顶部标题必须为{lq}成本配置比例情况报告{rq}。\n"
+        f"3. 正文必须包含{lq}我公司提审的一部“其他微短剧”，详情见下：{rq}。\n"
+        "4. 表格结构和表格线必须清晰，表头为：序号、微短剧名称、集数和总时长、总投资额（需<100万）、演员总片酬占比（需<40%）。\n"
+        f"5. 表格第一行必须是：1、{sub_name}、{episode_count}集，共{total_min}分钟、1万元、30%。\n"
+        "6. 中下部承诺文字按第一张 docx 图保留，文字清晰、中文不乱码。\n"
+        f"7. 底部必须融合第二张模板图中的红色圆形公章、红色方章/签名章、法定代表人或总编辑签名、日期位置。{company_instruction}\n"
+        "8. 所有文字、表格线、印章都要像同一张纸上真实打印/盖章形成的内容，不能出现灰色擦除块、局部贴图边界、上下拼接线、重影、错位。\n"
+        "9. 纸张放在浅色木纹桌面上，俯拍略带透视，纸张上边缘略远、下边缘略近，有自然阴影、轻微纸张纹理和真实手机拍摄感，画面干净，只保留纸和桌面，纸张四个角都要露出来。\n"
+        "10. 不要生成新的印章，不要参考任何其他印章样式，所有红章、签名章和章中文字必须以第二张模板图为准。\n"
+    )
+
+    paths = [docx_image_path, stamp_image_path]
+    for path in paths:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"AI 融合输入图不存在: {path}")
+
+    files = []
+    handles = []
+    try:
+        for path in paths:
+            handle = open(path, "rb")
+            handles.append(handle)
+            mime_type = mimetypes.guess_type(path)[0] or "image/jpeg"
+            files.append(("image", (os.path.basename(path), handle, mime_type)))
+        data = {
+            "model": image_model,
+            "prompt": prompt,
+            "size": "1024x1536",
+            "n": 1,
+            "response_format": "b64_json",
+        }
+        log(f"  请求 {url} ...")
+        response = _session.post(
+            url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            files=files,
+            data=data,
+            timeout=300,
+        )
+    finally:
+        for handle in handles:
+            handle.close()
+
+    if response.status_code != 200:
+        raise RuntimeError(f"AI 融合请求失败 HTTP {response.status_code}: {response.text[:500]}")
+
+    img = _decode_image_response(response)
+    log("  AI 融合完成")
+    return img
+
+
+def _decode_image_response(response: requests.Response) -> Image.Image:
+    try:
+        result = response.json()
+    except Exception as exc:
+        raise RuntimeError(f"AI 返回不是 JSON: {exc}") from exc
+
+    images = result.get("data", [])
+    if not images:
+        raise RuntimeError(f"AI 返回缺少 data 图片: {str(result)[:500]}")
+
+    first = images[0]
+    if "b64_json" in first and first["b64_json"]:
+        img_bytes = base64.b64decode(first["b64_json"])
+        return Image.open(BytesIO(img_bytes)).convert("RGB")
+
+    if "url" in first and first["url"]:
+        resp = _session.get(first["url"], timeout=120)
+        if resp.status_code != 200:
+            raise RuntimeError(f"下载 AI 图片失败 HTTP {resp.status_code}: {resp.text[:200]}")
+        return Image.open(BytesIO(resp.content)).convert("RGB")
+
+    raise RuntimeError(f"AI 返回图片格式不支持: {list(first.keys())}")
+
+
+def _ensure_min_report_size(img: Image.Image) -> Image.Image:
+    """AI 结果只做尺寸放大，不改内容；确保后续上传审查有足够分辨率。"""
+    img = img.convert("RGB")
+    min_w, min_h = 1440, 2048
+    if img.width >= min_w and img.height >= min_h:
+        return img
+
+    scale = max(min_w / img.width, min_h / img.height)
+    new_size = (math.ceil(img.width * scale), math.ceil(img.height * scale))
+    return img.resize(new_size, Image.LANCZOS)
+
+
 def _ai_naturalize(
     image_path: str,
     sub_name: str,
@@ -648,7 +774,7 @@ def _ai_naturalize(
     log_cb=None,
 ) -> Image.Image | None:
     """
-    使用 images/edits API，根据两张参考图生成真实照片效果的完整纸质文件。
+    使用 images/edits API 生成真实照片效果的完整纸质文件。
     """
     def log(msg):
         if log_cb:
