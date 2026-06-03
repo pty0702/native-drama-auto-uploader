@@ -13,9 +13,11 @@ import base64
 import math
 import mimetypes
 import os
+import queue
 import random
 import shutil
 import tempfile
+import threading
 from io import BytesIO
 from pathlib import Path
 
@@ -91,7 +93,7 @@ def generate_template_image(
 
     # ---- 步骤 2: docx → jpg ----
     log("步骤 2: 转换 docx 为图片...")
-    docx_img = _docx_to_image(filled_docx)
+    docx_img = _docx_to_image(filled_docx, log_cb=log)
 
     docx_image_path = os.path.join(output_dir, "_docx_filled_input.jpg")
     docx_img.save(docx_image_path, "JPEG", quality=95)
@@ -385,15 +387,13 @@ def _fill_docx(template_path: str | Path, sub_name: str, episode_count: int, tot
 # 步骤 2: docx → jpg
 # ============================================================
 
-def _docx_to_image(docx_path: str) -> Image.Image:
+def _docx_to_image(docx_path: str, log_cb=None) -> Image.Image:
     """将 docx 转为 PIL Image。必须走 Word/docx2pdf，高保真失败就直接报错。"""
     pdf_path = docx_path.replace(".docx", ".pdf")
 
-    try:
-        from docx2pdf import convert
-        convert(docx_path, pdf_path)
-    except Exception as exc:
-        raise RuntimeError(f"docx 转 PDF 失败，请确认本机 Word/docx2pdf 可用: {exc}") from exc
+    if log_cb:
+        log_cb("  正在调用本机 Word 转换 docx，最长等待 90 秒...")
+    _convert_docx_to_pdf_with_timeout(docx_path, pdf_path, timeout_sec=90)
 
     if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) <= 0:
         raise RuntimeError("docx 转 PDF 失败：未生成有效 PDF")
@@ -408,6 +408,47 @@ def _docx_to_image(docx_path: str) -> Image.Image:
 
     # 旧低保真兜底已停用：不再用 PIL 简易渲染 docx。
     # return _render_docx_as_image(docx_path)
+
+
+def _convert_docx_to_pdf_with_timeout(docx_path: str, pdf_path: str, timeout_sec: int = 90) -> None:
+    """用 docx2pdf/Word 转 PDF；Word 卡住时超时失败，不切换兜底。"""
+    result_queue: queue.Queue[tuple[bool, BaseException | None]] = queue.Queue(maxsize=1)
+
+    def worker() -> None:
+        pythoncom = None
+        try:
+            try:
+                import pythoncom as _pythoncom
+                pythoncom = _pythoncom
+                pythoncom.CoInitialize()
+            except Exception:
+                pythoncom = None
+
+            from docx2pdf import convert
+            convert(docx_path, pdf_path)
+            result_queue.put((True, None))
+        except BaseException as exc:
+            result_queue.put((False, exc))
+        finally:
+            if pythoncom is not None:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+
+    thread = threading.Thread(target=worker, name="docx2pdf-convert", daemon=True)
+    thread.start()
+    thread.join(timeout_sec)
+
+    if thread.is_alive():
+        raise RuntimeError(
+            "docx 转 PDF 超时：本机 Word 可能未安装、未激活，或弹出了需要人工确认的窗口。"
+            "请关闭所有 Word 窗口，确认 Microsoft Word 可正常打开后重试。"
+        )
+
+    ok, exc = result_queue.get() if not result_queue.empty() else (False, RuntimeError("docx2pdf 未返回结果"))
+    if not ok:
+        raise RuntimeError(f"docx 转 PDF 失败，请确认本机 Word/docx2pdf 可用: {exc}") from exc
 
 
 def _render_docx_as_image(docx_path: str) -> Image.Image:
