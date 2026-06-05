@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,6 +55,29 @@ from .settings import (
     save_config,
 )
 from .updater import check_update, download_update, schedule_update_and_exit
+
+
+def license_remaining_text(status) -> str:
+    """Format the verified license status for the main window title area."""
+    if not status:
+        return "授权未验证"
+    customer = (getattr(status, "customer", "") or "").strip()
+    expires_at = (getattr(status, "expires_at", "") or "").strip()
+    if not expires_at:
+        return f"{customer} · 永久授权" if customer else "授权有效"
+    expires_dt = parse_server_time(expires_at)
+    if not expires_dt:
+        suffix = f"有效期至 {expires_at}"
+        return f"{customer} · {suffix}" if customer else suffix
+    now = datetime.now(timezone.utc)
+    days_left = max(0, (expires_dt.date() - now.date()).days)
+    date_text = expires_dt.astimezone().strftime("%Y-%m-%d")
+    suffix = f"有效期至 {date_text}，剩余 {days_left} 天"
+    return f"{customer} · {suffix}" if customer else suffix
+
+
+def license_title(status) -> str:
+    return f"ReCreate AI - {license_remaining_text(status)}"
 
 
 class Signals(QObject):
@@ -1420,6 +1444,25 @@ def main() -> None:
     app = QApplication([])
     app.setFont(QFont("Microsoft YaHei UI", 10))
     config = load_config()
+    if os.environ.get("RECREATE_AI_SMOKE_TEST") == "1":
+        result_path = os.environ.get("RECREATE_AI_SMOKE_RESULT", "")
+        try:
+            smoke_key = os.environ.get("RECREATE_AI_LICENSE_KEY", "").strip()
+            if smoke_key:
+                config.license_key = smoke_key
+            status = verify_license(config)
+            if not status.ok:
+                raise RuntimeError(status.message)
+            MainWindow(status)
+            if result_path:
+                Path(result_path).write_text("ok", encoding="utf-8")
+            QTimer.singleShot(100, app.quit)
+            app.exec_()
+        except Exception as exc:
+            if result_path:
+                Path(result_path).write_text(str(exc), encoding="utf-8")
+            raise
+        return
     dialog = LicenseDialog(config)
     if dialog.exec_() != QDialog.Accepted:
         return
