@@ -301,6 +301,92 @@ class ApiTestThread(threading.Thread):
 
 
 
+class LicenseDialog(QDialog):
+    def __init__(self, config: AppConfig, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.config = config
+        self.license_status = None
+        self.setWindowTitle("ReCreate AI 授权验证")
+        self.setModal(True)
+        self.setMinimumWidth(720)
+        self.resize(760, 360)
+        self.setStyleSheet(APP_STYLE)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(16)
+
+        title = QLabel("请输入卡密")
+        title.setObjectName("dialogTitle")
+        layout.addWidget(title)
+
+        desc = QLabel("软件启动前需要先通过授权验证，未验证不能进入主界面。")
+        desc.setObjectName("dialogHint")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        layout.addWidget(QLabel("卡密"))
+        self.le_license_key = QLineEdit(config.license_key)
+        self.le_license_key.setObjectName("licenseInput")
+        self.le_license_key.setEchoMode(QLineEdit.Normal)
+        self.le_license_key.setPlaceholderText("请输入客户卡密")
+        layout.addWidget(self.le_license_key)
+
+        machine_row = QHBoxLayout()
+        machine_row.addWidget(QLabel("机器码"))
+        self.le_machine_code = QLineEdit(get_machine_code())
+        self.le_machine_code.setReadOnly(True)
+        machine_row.addWidget(self.le_machine_code, stretch=1)
+        btn_copy = QPushButton("复制")
+        btn_copy.clicked.connect(self.copy_machine_code)
+        machine_row.addWidget(btn_copy)
+        layout.addLayout(machine_row)
+
+        self.lbl_status = QLabel("")
+        self.lbl_status.setObjectName("apiStatus")
+        layout.addWidget(self.lbl_status)
+
+        btn_row = QHBoxLayout()
+        btn_cancel = QPushButton("退出")
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addStretch()
+        self.btn_verify = QPushButton("验证并进入")
+        self.btn_verify.setObjectName("primaryButton")
+        self.btn_verify.clicked.connect(self.verify_and_accept)
+        btn_row.addWidget(self.btn_verify)
+        layout.addLayout(btn_row)
+
+    def copy_machine_code(self) -> None:
+        QApplication.clipboard().setText(self.le_machine_code.text())
+        self.set_status("机器码已复制", "ok")
+
+    def set_status(self, text: str, state: str) -> None:
+        self.lbl_status.setText(text)
+        self.lbl_status.setProperty("state", state)
+        self.lbl_status.style().unpolish(self.lbl_status)
+        self.lbl_status.style().polish(self.lbl_status)
+
+    def verify_and_accept(self) -> None:
+        key = self.le_license_key.text().strip()
+        if not key:
+            self.set_status("请先输入卡密", "error")
+            return
+        self.config.license_key = key
+        save_config(self.config)
+        self.btn_verify.setEnabled(False)
+        self.set_status("正在验证...", "running")
+        QApplication.processEvents()
+        status = verify_license(self.config)
+        self.btn_verify.setEnabled(True)
+        if not status.ok:
+            self.set_status(status.message, "error")
+            return
+        self.license_status = status
+        save_config(self.config)
+        self.accept()
+
+
 class ModelFetchThread(threading.Thread):
     def __init__(self, signals: Signals, kind: str, config: AppConfig) -> None:
         super().__init__(daemon=True)
