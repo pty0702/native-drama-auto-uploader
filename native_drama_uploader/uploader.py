@@ -308,6 +308,12 @@ async def enable_ai_statement(page: Page) -> None:
 async def upload_file_after_wheel(page: Page, label_text: str, files: str | Path | list[str | Path], step_name: str) -> None:
     file_list = files if isinstance(files, list) else [files]
     paths = [str(Path(path)) for path in file_list]
+    lower_paths = [path.lower() for path in paths]
+    expect_video = any(path.endswith((".mp4", ".mov", ".m4v")) for path in lower_paths)
+    expect_non_video = any(
+        path.endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp", ".pdf", ".doc", ".docx"))
+        for path in lower_paths
+    )
     await wheel_to_text(page, label_text, step_name)
     label = page.get_by_text(label_text, exact=False).first
     label_box = await label.bounding_box(timeout=3000)
@@ -349,6 +355,11 @@ async def upload_file_after_wheel(page: Page, label_text: str, files: str | Path
     for index in range(await file_inputs.count()):
         file_input = file_inputs.nth(index)
         try:
+            accept = (await file_input.get_attribute("accept") or "").lower()
+            if expect_video and accept and not any(key in accept for key in ("video", ".mp4", ".mov", ".m4v")):
+                continue
+            if expect_non_video and accept and any(key in accept for key in ("video", ".mp4", ".mov", ".m4v")):
+                continue
             score = await file_input.evaluate(
                 """
                 (el, args) => {
@@ -427,13 +438,23 @@ class WeChatNativeDramaUploader:
                         self._do_upload(task),
                         timeout=overall_timeout,
                     )
-                except asyncio.TimeoutError:
+                except asyncio.TimeoutError as exc:
+                    if type(exc) is not asyncio.TimeoutError:
+                        raise
                     log(f"上传任务总超时({overall_timeout}s)，强制结束")
                     raise RuntimeError(f"上传任务超时({overall_timeout // 60}分钟)，请检查网络和页面状态")
                 except Exception as exc:
                     await save_error(self.page, "run_task", exc)
                     raise
                 finally:
+                    delay_sec = max(0, int(getattr(self.config, "close_delay_after_upload_sec", 0) or 0))
+                    if delay_sec > 0 and self.page is not None:
+                        try:
+                            if not self.page.is_closed():
+                                log(f"上传流程已结束，窗口保留 {delay_sec} 秒后自动关闭")
+                                await self.page.wait_for_timeout(delay_sec * 1000)
+                        except Exception as exc:
+                            log(f"关闭前等待失败: {exc}")
                     try:
                         await self.context.close()
                     except Exception:
@@ -443,11 +464,24 @@ class WeChatNativeDramaUploader:
                     except Exception:
                         pass
         except Exception as exc:
-            # 确保异常信息清晰
+            # 确保异常信息清晰，给出排查建议
             error_msg = str(exc)
             if not error_msg:
                 error_msg = f"上传失败({type(exc).__name__})"
-            log(f"上传任务失败: {error_msg}")
+            if "Target page, context or browser has been closed" in error_msg:
+                error_msg = (
+                    "浏览器意外关闭，可能原因：\n"
+                    "1. 网络不稳定导致页面断开\n"
+                    "2. 微信平台会话过期，请重新扫码登录\n"
+                    "3. 浏览器被安全软件拦截\n"
+                    "4. 系统资源不足\n\n"
+                    "建议：重新扫码登录后重试，或重启电脑后再试。"
+                )
+                log(f"上传任务失败: 浏览器意外关闭")
+            elif "Timeout" in error_msg:
+                log(f"上传任务超时: {error_msg[:200]}")
+            else:
+                log(f"上传任务失败: {error_msg[:500]}")
             raise RuntimeError(error_msg) from exc
 
     async def _do_upload(self, task: NativeDramaTask) -> None:
@@ -470,7 +504,27 @@ class WeChatNativeDramaUploader:
             raise FileNotFoundError(f"登录态文件不存在: {account}")
         await page.goto(PLAYLET_URL)
         await settle_page(page, require_networkidle=True)
-        await wait_for_any_text(page, ("上架剧集", "剧集管理", "收入与服务"), timeout_ms=15000)
+        if "login" in page.url:
+            raise RuntimeError("登录态已失效，当前跳转到了登录页，请重新扫码登录。")
+        if "native-drama-post" not in page.url:
+            try:
+                await wait_for_any_text(page, ("上架剧集", "剧集管理", "收入与服务"), timeout_ms=15000)
+            except Exception:
+                log("首页未识别到入口文案，尝试直达上架页")
+                await page.goto(NATIVE_DRAMA_POST_URL)
+                await settle_page(page, require_networkidle=True)
+                if "login" in page.url:
+                    raise RuntimeError("登录态已失效，直达发布页时跳转到了登录页，请重新扫码登录。")
+                if "native-drama-post" in page.url:
+                    await settle_page(page)
+                    await wheel_back_to_top(page)
+                    await wheel_to_text(page, "剧目名称", "wait_step1", max_attempts=20)
+                    return
+        if "native-drama-post" in page.url:
+            await settle_page(page)
+            await wheel_back_to_top(page)
+            await wheel_to_text(page, "剧目名称", "wait_step1", max_attempts=20)
+            return
         await page.wait_for_timeout(2000)
         await safe_click(
             page,
@@ -535,9 +589,23 @@ class WeChatNativeDramaUploader:
             "点击下一步",
         )
         await settle_page(page)
+        # 先检查是否有表单错误提示
+        body_text = await page.locator("body").first.inner_text(timeout=5000)
+        error_keywords = ["不支持的格式", "格式不支持", "格式错误", "格式不正确",
+                          "请检查", "上传失败", "不符合要求", "不能为空", "请选择",
+                          "校验失败", "提交失败", "参数错误"]
+        for kw in error_keywords:
+            if kw in body_text:
+                await dump_page_state(page, "step1_error")
+                # 提取错误信息上下文
+                idx = body_text.find(kw)
+                context = body_text[max(0,idx-50):idx+100]
+                raise RuntimeError(
+                    f"表单提交被拒：页面提示「{kw}」。"
+                    f"上下文: ...{context}..."
+                    f"当前 URL: {page.url}"
+                )
         # 检查是否还在 step1（页面还有"剧目名称"等字段说明没跳转）
-        # step1 的"选择文件"按钮会误导文本检测，改用字段存在性判断
-        body_text = await page.locator("body").first.inner_text(timeout=3000)
         if "剧目名称" in body_text and "总集数" in body_text:
             await dump_page_state(page, "step1_next_failed")
             raise RuntimeError(
@@ -619,18 +687,27 @@ class WeChatNativeDramaUploader:
             await save_screenshot(page, "step2_video_select_failed.png")
             raise RuntimeError("第二步没有找到可用的视频上传入口")
 
-        await page.wait_for_timeout(500)
-        await self.wait_for_all_videos(task.episode_count)
+        await page.wait_for_timeout(2000)
+        # 文件选择后，点击「开始上传」/「上传」按钮触发实际上传
+        await self._click_start_upload(page)
+        all_uploaded = await self.wait_for_all_videos(task.episode_count)
+        if not all_uploaded:
+            raise RuntimeError(
+                f"剧集 {task.drama_name} 视频上传仍有失败（已重试3次），已跳过本剧"
+            )
         if task.submit_after_upload:
             await self.confirm_submit()
 
-    async def wait_for_all_videos(self, total: int) -> None:
+    async def wait_for_all_videos(self, total: int) -> bool:
+        """等待视频全部上传完成，失败时自动重试。返回 True=全部成功, False=跳过本剧"""
         assert self.page is not None
         page = self.page
         deadline = asyncio.get_running_loop().time() + self.config.upload_timeout_min * 60
         stuck_count = 0
         poll_interval = min(self.config.upload_poll_min * 60, 60)  # 轮询最多60秒一次
         poll_count = 0
+        retry_count = 0
+        max_retries = 3
         while asyncio.get_running_loop().time() < deadline:
             poll_count += 1
             # 截图用于诊断，失败不影响流程
@@ -656,7 +733,7 @@ class WeChatNativeDramaUploader:
                         try { document.body.childNodes.forEach(walk); } catch(e) {}
                         return result;
                     }
-                """, timeout=10000)
+                """)
             except Exception as exc:
                 log(f"获取页面文本失败: {exc}")
                 await page.wait_for_timeout(poll_interval * 1000)
@@ -665,7 +742,7 @@ class WeChatNativeDramaUploader:
             for frame in page.frames:
                 try:
                     frame_text = await frame.evaluate(
-                        "() => document.body?.innerText || ''", timeout=5000
+                        "() => document.body?.innerText || ''"
                     )
                     if frame_text and len(frame_text) > len(text):
                         text = frame_text
@@ -686,15 +763,30 @@ class WeChatNativeDramaUploader:
             compact = re.sub(r"\s+", "", text)
             log(f"第 {poll_count} 次轮询 | URL: {page.url} | 文本长度: {len(text)}")
             upload_progress = re.search(r"已上传成功\s*(\d+)\s*/\s*(\d+)\s*集", text)
+            done = 0
+            expected = total
             if upload_progress:
                 done = int(upload_progress.group(1))
                 expected = int(upload_progress.group(2))
                 log(f"上传进度: {done}/{expected}")
                 if done == expected == total:
                     log(f"全部上传成功 {done}/{expected} 集，准备确认提审")
-                    return
+                    return True
             else:
                 log(f"未匹配到进度(前200): {text[:200]}")
+            # 检测失败/红色状态：查找 "未能上传" "上传失败" 或 "重试" 按钮
+            has_failed = bool(re.search(r"未能上传|上传失败|上传异常", text))
+            has_retry_btn = bool(re.search(r"重试", text))
+            if has_failed or (has_retry_btn and done < total):
+                if retry_count < max_retries:
+                    retry_count += 1
+                    log(f"检测到上传失败条目，点击重试 ({retry_count}/{max_retries})...")
+                    await self._click_retry_buttons(page)
+                    await page.wait_for_timeout(5000)
+                    continue
+                else:
+                    log(f"已重试 {max_retries} 次，仍有失败条目，跳过本剧")
+                    return False
             # 检测是否卡在 0/N（上传没触发），连续3次就报错
             if compact.startswith("0/") or "0/" in compact[:10]:
                 stuck_count += 1
@@ -707,6 +799,54 @@ class WeChatNativeDramaUploader:
                 stuck_count = 0
             await page.wait_for_timeout(poll_interval * 1000)
         raise TimeoutError(f"等待视频上传完成超时({self.config.upload_timeout_min}分钟): {total}集")
+
+    async def _click_start_upload(self, page: Page) -> None:
+        """文件选择后，查找并点击「开始上传」/「上传」按钮触发上传。"""
+        upload_btn_texts = ["开始上传", "上传", "确认上传", "开始"]
+        for text in upload_btn_texts:
+            try:
+                locators = [
+                    page.get_by_role("button", name=text),
+                    page.locator(f"button:has-text('{text}')"),
+                    page.get_by_text(text, exact=False),
+                ]
+                for locator in locators:
+                    count = await locator.count()
+                    for i in range(count):
+                        btn = locator.nth(i)
+                        if await btn.is_visible(timeout=1000):
+                            await btn.click(timeout=3000)
+                            log(f"已点击「{text}」按钮，触发上传")
+                            await page.wait_for_timeout(2000)
+                            return
+            except Exception:
+                continue
+        log("未找到「开始上传」按钮，可能自动开始上传")
+
+    async def _click_retry_buttons(self, page: Page) -> None:
+        """点击页面上所有可见的「重试」按钮。"""
+        retry_locators = [
+            page.get_by_role("button", name="重试"),
+            page.locator("button:has-text('重试')"),
+            page.locator("a:has-text('重试')"),
+            page.get_by_text("重试", exact=False),
+        ]
+        clicked = 0
+        for locator in retry_locators:
+            try:
+                count = await locator.count()
+                for i in range(count):
+                    btn = locator.nth(i)
+                    if await btn.is_visible(timeout=1000):
+                        await btn.click(timeout=3000)
+                        clicked += 1
+                        await page.wait_for_timeout(800)
+            except Exception:
+                continue
+        if clicked > 0:
+            log(f"  已点击 {clicked} 个重试按钮")
+        else:
+            log("  未找到可点击的重试按钮，等待下次轮询")
 
     async def confirm_submit(self) -> None:
         assert self.page is not None

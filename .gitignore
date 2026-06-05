@@ -1,10 +1,36 @@
 .venv/
-__pycache__/
-*.pyc
-debug/*.png
-debug/*.json
-debug/*.txt
-db/*.tmp
-cookies/**/*.json
 .idea/
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Runtime state and private user data
 db/
+cookies/
+debug/
+log/
+*.log
+*.tmp
+
+# Build outputs and release packages
+build/
+dist/
+_internal/
+ffmpeg/
+ReCreate AI.exe
+ReCreate_AI_release_*/
+ReCreate_AI_release_*.zip
+*.spec.bak
+
+# Local material folders and large archives
+sucai/*
+!sucai/
+!sucai/视频.docx
+!sucai/模板.jpg
+*.rar
+*.7z
+*.zip
+
+# Deployment secrets / server runtime data
+deploy/
+license_admin.py

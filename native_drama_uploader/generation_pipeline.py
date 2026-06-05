@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -21,7 +22,7 @@ from .settings import AppConfig, DEBUG_DIR, IMAGE_MODEL, SUCAI_DIR, TEXT_MODEL
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[int, str], None]
-REQUIRED_SUCAI_FILES = ("视频.docx", "模板.jpg", "照片参考.png")
+REQUIRED_TEMPLATE_FILES = ("视频.docx", "模板.jpg")
 
 
 class DuplicateDramaNameSkipped(RuntimeError):
@@ -73,6 +74,11 @@ def find_source_bmp_proofs(folder: str | Path) -> list[Path]:
     )
 
 
+def find_source_cost_table(folder: str | Path) -> Path | None:
+    """优先识别原素材里的 成本表.xxx，存在时直接复用，不再调用 AI 生成。"""
+    return find_named_image(folder, "成本表")
+
+
 def convert_bmp_proofs(proof_src: list[Path], output_dir: Path, log: LogFn) -> list[Path]:
     """将源 BMP 证明材料转为成品目录里的 证明1.jpg、证明2.jpg。"""
     results: list[Path] = []
@@ -91,11 +97,6 @@ def validate_generation_inputs(sources: list[str | Path]) -> list[str]:
     """流水线启动前校验公共素材和每个视频包的必需文件。"""
     errors: list[str] = []
 
-    for filename in REQUIRED_SUCAI_FILES:
-        path = SUCAI_DIR / filename
-        if not path.exists() or not path.is_file():
-            errors.append(f"缺少公共素材: {path}")
-
     for source in sources:
         source_path = Path(source)
         if not source_path.exists() or not source_path.is_dir():
@@ -107,6 +108,11 @@ def validate_generation_inputs(sources: list[str | Path]) -> list[str]:
             errors.append(f"视频包缺少简介 txt: {source_path}")
         if not find_folder_named_cover(source_path):
             errors.append(f"视频包缺少海报图片，必须命名为 文件夹名.jpg/png/jpeg: {source_path}")
+        if not find_source_cost_table(source_path):
+            for filename in REQUIRED_TEMPLATE_FILES:
+                path = SUCAI_DIR / filename
+                if not path.exists() or not path.is_file():
+                    errors.append(f"缺少公共素材: {path}")
 
     return errors
 
@@ -144,6 +150,45 @@ def _cleanup_processing_outputs(source: str | Path, config: AppConfig, log: LogF
                 log(f"已清理临时成品目录: {candidate}")
             except Exception as cleanup_exc:
                 log(f"临时成品目录清理失败，请手动处理: {candidate} / {cleanup_exc}")
+
+
+def _finalize_output_dir(work_path: Path, final_output_path: Path, log: LogFn) -> None:
+    """
+    将隐藏的 processing 目录切换为最终成品目录。
+
+    Windows 下偶发会在目录 rename 时抛出 [WinError 5]，通常是缩略图/索引/杀毒短暂占用。
+    这里先重试 rename，仍失败再降级为 copytree，避免“内容已生成成功但最后一步丢单”。
+    """
+    if final_output_path.exists():
+        shutil.rmtree(str(final_output_path))
+
+    last_exc: Exception | None = None
+    for attempt in range(5):
+        try:
+            work_path.rename(final_output_path)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            log(f"最终落盘改名被占用，等待重试 {attempt + 1}/5: {exc}")
+            time.sleep(0.8)
+        except OSError as exc:
+            last_exc = exc
+            if getattr(exc, "winerror", None) == 5:
+                log(f"最终落盘改名被系统拒绝访问，等待重试 {attempt + 1}/5: {exc}")
+                time.sleep(0.8)
+                continue
+            raise
+
+    log("目录改名多次失败，改用复制兜底保存最终成品目录...")
+    try:
+        shutil.copytree(str(work_path), str(final_output_path), dirs_exist_ok=False)
+        shutil.rmtree(str(work_path))
+        log("已通过复制方式完成最终落盘")
+        return
+    except Exception as exc:
+        raise RuntimeError(
+            f"最终成品目录落盘失败，临时成品仍保留在: {work_path}；原始错误: {last_exc or exc}"
+        ) from exc
 
 
 def run_generation_pipeline(
@@ -207,16 +252,22 @@ def _run_pipeline(
         raise FileNotFoundError("源文件夹中未找到视频文件")
     # 源包证明材料只从 BMP 图片提取，生成时统一转为 证明1.jpg、证明2.jpg...
     proof_src = find_source_bmp_proofs(source_path)
+    cost_table_src = find_source_cost_table(source_path)
     poster_path = find_folder_named_cover(source_path)
     poster_src = [str(poster_path)] if poster_path else []
 
     if not poster_src:
         raise FileNotFoundError("源文件夹中未找到海报图片（必须命名为 文件夹名.jpg/png/jpeg）")
 
-    log(f"发现: {len(video_files)} 个视频，{len(poster_src)} 张海报，{len(proof_src)} 张 BMP 证明，1 个 TXT")
+    log(
+        f"发现: {len(video_files)} 个视频，{len(poster_src)} 张海报，"
+        f"{len(proof_src)} 张 BMP 证明，1 个 TXT，成本表: {cost_table_src.name if cost_table_src else '未提供'}"
+    )
     log(f"视频文件: {video_files}")
     log(f"海报图片: {poster_src}")
     log(f"BMP 证明材料: {[str(p) for p in proof_src]}")
+    if cost_table_src:
+        log(f"原素材成本表: {cost_table_src}")
     log(f"TXT 文件: {txt_file}")
     progress(5, "开始处理")
 
@@ -273,6 +324,7 @@ def _run_pipeline(
         api_key=config.image_api_key,
         api_base_url=config.image_api_base_url,
         image_model=image_model,
+        synopsis=summary,
         log_cb=log,
     )
     # 将第一张 AI 海报重命名为成品文件夹同名图片，确保上传时能自动识别为封面
@@ -284,36 +336,43 @@ def _run_pipeline(
             log(f"  封面已命名: {cover_dst.name}")
     progress(75, "海报处理完成")
 
-    # 步骤 4: 成本配置模板 — 在转码后的成品文件夹里生成新的模版.jpg
-    log("步骤 4/4: 生成并审查成本配置模板...")
-    docx_template = SUCAI_DIR / "视频.docx"
-    stamp_image = SUCAI_DIR / "模板.jpg"
-    if docx_template.exists() and stamp_image.exists():
-        generate_template_image(
-            docx_template,
-            str(work_path),
-            sub_name,
-            episode_count,
-            total_duration,
-            stamp_image=stamp_image,
-            api_key=config.image_api_key,
-            api_base_url=config.image_api_base_url,
-            image_model=image_model,
-            log_cb=log,
-        )
-        progress(90, "成本配置模板生成完成")
+    # 步骤 4: 成本配置模板 — 优先复用原素材里的 成本表.xxx，否则再走 AI 生成。
+    log("步骤 4/4: 处理成本配置模板...")
+    if cost_table_src:
+        template_dst = work_path / "模版.jpg"
+        with Image.open(str(cost_table_src)) as img:
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            img.save(str(template_dst), format="JPEG", quality=95, optimize=True)
+        log(f"  已直接复用原素材成本表: {template_dst.name} <- {cost_table_src.name}")
+        progress(90, "已复用原素材成本表")
     else:
-        log(f"  docx 或印章底图不存在，跳过: {docx_template} / {stamp_image}")
-        progress(90, "跳过成本配置模板")
+        docx_template = SUCAI_DIR / "视频.docx"
+        stamp_image = SUCAI_DIR / "模板.jpg"
+        if docx_template.exists() and stamp_image.exists():
+            generate_template_image(
+                docx_template,
+                str(work_path),
+                sub_name,
+                episode_count,
+                total_duration,
+                stamp_image=stamp_image,
+                api_key=config.image_api_key,
+                api_base_url=config.image_api_base_url,
+                image_model=image_model,
+                log_cb=log,
+            )
+            progress(90, "成本配置模板生成完成")
+        else:
+            log(f"  docx 或印章底图不存在，跳过: {docx_template} / {stamp_image}")
+            progress(90, "跳过成本配置模板")
 
     if len(list(work_path.glob("*.mp4"))) != len(video_files):
         raise RuntimeError(
             f"成品视频数量校验失败: 输入 {len(video_files)} 个，输出 {len(list(work_path.glob('*.mp4')))} 个"
         )
 
-    if final_output_path.exists():
-        shutil.rmtree(str(final_output_path))
-    work_path.rename(final_output_path)
+    _finalize_output_dir(work_path, final_output_path, log)
     log(f"最终输出文件夹: {final_output_path}")
 
     try:

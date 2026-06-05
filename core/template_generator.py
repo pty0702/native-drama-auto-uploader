@@ -18,13 +18,16 @@ import random
 import shutil
 import tempfile
 import threading
+from datetime import date
 from io import BytesIO
 from pathlib import Path
 
 import requests
 from docx import Document
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps, ImageStat
 
+from core.ark_image import generate_ark_image, is_ark_image_api
+from core.dashscope_image import generate_dashscope_image, is_dashscope_api
 from native_drama_uploader.settings import IMAGE_API_BASE_URL, IMAGE_MODEL, SUCAI_DIR
 
 # 绕过系统代理
@@ -36,6 +39,18 @@ def _normalize_api_base_url(api_base_url):
     api_base_url = (api_base_url or IMAGE_API_BASE_URL).rstrip("/")
     if not api_base_url:
         raise RuntimeError("未配置图片 API 地址")
+    if is_ark_image_api(api_base_url):
+        if api_base_url.endswith("/api/v3"):
+            return api_base_url
+        if api_base_url.endswith("/api"):
+            return f"{api_base_url}/v3"
+        return f"{api_base_url}/api/v3"
+    if is_dashscope_api(api_base_url):
+        if api_base_url.endswith("/api/v1"):
+            return api_base_url
+        if api_base_url.endswith("/api"):
+            return f"{api_base_url}/v1"
+        return f"{api_base_url}/api/v1"
     if not api_base_url.endswith("/v1"):
         api_base_url = f"{api_base_url}/v1"
     return api_base_url
@@ -75,9 +90,9 @@ def generate_template_image(
     template_path = str(template_path)
     stamp_image_path = _resolve_stamp_image(template_path, stamp_image)
     if not os.path.exists(template_path):
-        raise FileNotFoundError(f"成本模板 docx 不存在: {template_path}")
+        raise FileNotFoundError(f"输入素材问题：成本模板 docx 不存在: {template_path}")
     if not os.path.exists(stamp_image_path):
-        raise FileNotFoundError(f"印章底图不存在: {stamp_image_path}")
+        raise FileNotFoundError(f"输入素材问题：印章底图不存在: {stamp_image_path}")
 
     # ---- 步骤 0: 从 docx 提取报审机构 ----
     company_name = _extract_company_from_docx(template_path)
@@ -104,10 +119,86 @@ def generate_template_image(
     # merged_path = os.path.join(output_dir, "_merged_input.jpg")
     # merged_img.save(merged_path, "JPEG", quality=95)
 
-    # 旧兜底已停用：不再直接擦写 模板.jpg 的表格区域。
-    # stable_input = _fill_stamp_template(stamp_image_path, output_dir, sub_name, episode_count, total_min, log)
+    # ---- 步骤 3: 稳定版：AI 只生成桌面背景，本地合成清晰纸张 ----
+    active_model = image_model or IMAGE_MODEL
+    out_path = os.path.join(output_dir, "模版.jpg")
+    candidate_path = os.path.join(output_dir, "_stable_template_candidate.jpg")
+    log(f"步骤 3: 调用 AI({active_model}) 生成桌面背景，本地合成清晰模板...")
+    final_img = _generate_stable_template_photo(
+        docx_image_path=docx_image_path,
+        stamp_image_path=stamp_image_path,
+        output_dir=output_dir,
+        sub_name=sub_name,
+        episode_count=episode_count,
+        total_min=total_min,
+        api_key=api_key,
+        api_base_url=api_base_url,
+        image_model=active_model,
+        log_cb=log,
+    )
+    final_img = _ensure_min_report_size(final_img, normalize_side_bg=False)
+    final_img.save(candidate_path, "JPEG", quality=95)
 
-    # ---- 步骤 3: AI 融合 docx 和印章模板 ----
+    log("步骤 4: 审查稳定版最终图片...")
+    ok, report = validate_template_image(
+        candidate_path,
+        sub_name=sub_name,
+        episode_count=episode_count,
+        total_min=total_min,
+    )
+    if not ok:
+        raise RuntimeError(f"稳定版成本配置模板审查未通过: {report}")
+
+    shutil.copy2(candidate_path, out_path)
+    _cleanup_intermediate_files(output_dir)
+    log(f"  审查通过: {report}")
+    log(f"成本配置模板完成: {out_path}")
+    return out_path
+
+
+def generate_template_image_legacy_ai_fuse(
+    template_path: str | Path,
+    output_dir: str,
+    sub_name: str,
+    episode_count: int,
+    total_duration_sec: float,
+    stamp_image: str | Path | None = None,
+    api_key: str | None = None,
+    api_base_url: str | None = None,
+    image_model: str | None = None,
+    max_attempts: int = 3,
+    log_cb=None,
+) -> str:
+    """旧版方案：docx 图和印章模板图整体交给 AI 融合。保留用于必要时回退。"""
+    def log(msg):
+        if log_cb:
+            log_cb(msg)
+
+    os.makedirs(output_dir, exist_ok=True)
+    template_path = str(template_path)
+    stamp_image_path = _resolve_stamp_image(template_path, stamp_image)
+    if not os.path.exists(template_path):
+        raise FileNotFoundError(f"输入素材问题：成本模板 docx 不存在: {template_path}")
+    if not os.path.exists(stamp_image_path):
+        raise FileNotFoundError(f"输入素材问题：印章底图不存在: {stamp_image_path}")
+
+    company_name = _extract_company_from_docx(template_path)
+    if company_name:
+        log(f"从 docx 提取报审机构: {company_name}")
+    else:
+        log("未从 docx 提取到报审机构，AI 将自行判断")
+
+    log("步骤 1: 填写成本配置模板...")
+    total_min = duration_minutes_for_report(total_duration_sec)
+    filled_docx = _fill_docx(template_path, sub_name, episode_count, total_min)
+
+    log("步骤 2: 转换 docx 为图片...")
+    docx_img = _docx_to_image(filled_docx, log_cb=log)
+
+    docx_image_path = os.path.join(output_dir, "_docx_filled_input.jpg")
+    docx_img.save(docx_image_path, "JPEG", quality=95)
+    log(f"  已保存填字后的 docx 图片: {docx_image_path}")
+
     active_model = image_model or IMAGE_MODEL
     log(f"步骤 3: 调用 AI({active_model}) 融合 docx 和印章模板...")
     ai_img = _ai_fuse_template_photo(
@@ -124,11 +215,9 @@ def generate_template_image(
     )
     out_path = os.path.join(output_dir, "模版.jpg")
     candidate_path = os.path.join(output_dir, "_ai_fused_candidate.jpg")
-    ai_img = _ensure_min_report_size(ai_img)
+    ai_img = _ensure_min_report_size(ai_img, normalize_side_bg=False)
     ai_img.save(candidate_path, "JPEG", quality=95)
 
-    # 旧本地照片化兜底已停用：AI 融合失败或审查失败时直接报错。
-    # final_img = _make_paper_photo(merged_path, seed=20260530 + attempt)
     log("步骤 4: 审查 AI 融合最终图片...")
     ok, report = validate_template_image(
         candidate_path,
@@ -154,6 +243,9 @@ def _cleanup_intermediate_files(output_dir: str) -> None:
         "_ai_naturalized.*",
         "_docx_filled_input.*",
         "_ai_fused_candidate.*",
+        "_stable_template_candidate.*",
+        "_stable_paper_input.*",
+        "_ai_table_background.*",
     ):
         for path in Path(output_dir).glob(pattern):
             try:
@@ -171,17 +263,32 @@ def validate_template_image(
     """审查最终图片是否满足上传材料基本规范。"""
     path = Path(image_path)
     if not path.exists() or path.stat().st_size < 50_000:
-        return False, "图片不存在或文件过小"
+        return False, "AI最终图问题：最终融合图片不存在或文件过小"
 
     try:
         img = Image.open(path).convert("RGB")
     except Exception as exc:
-        return False, f"图片无法打开: {exc}"
+        return False, f"AI最终图问题：最终融合图片无法打开: {exc}"
 
     width, height = img.size
     checks: list[str] = []
-    if width < 1400 or height < 1900:
-        checks.append(f"分辨率不足({width}x{height})")
+    if max(width, height) < 1500 or min(width, height) < 1100:
+        checks.append(f"AI最终图问题：最终融合图分辨率不足({width}x{height})")
+
+    paper_bbox = _find_paper_bbox(img)
+    if paper_bbox is None:
+        checks.append("AI最终图问题：未识别到完整白纸区域，可能是AI生成的纸张主体不完整，或背景过亮导致纸张识别失败")
+    else:
+        x0, y0, x1, y1 = paper_bbox
+        left_margin = x0
+        top_margin = y0
+        right_margin = width - 1 - x1
+        bottom_margin = height - 1 - y1
+        if min(left_margin, top_margin, right_margin, bottom_margin) <= 0:
+            checks.append(
+                "AI最终图问题：纸张四角未完整露出，"
+                f"或左右/顶部亮背景被识别成纸张(L={left_margin}, T={top_margin}, R={right_margin}, B={bottom_margin})"
+            )
 
     # 红章区域应有足够红色像素。
     red_pixels = 0
@@ -203,16 +310,84 @@ def validate_template_image(
     dark_ratio = dark_pixels / max(1, total_samples)
     non_white_ratio = non_white_pixels / max(1, total_samples)
 
-    if red_ratio < 0.0012:
-        checks.append(f"红章区域不足({red_ratio:.4f})")
+    if red_ratio < 0.0007:
+        checks.append(f"AI最终图问题：红章区域不足({red_ratio:.4f})")
     if dark_ratio < 0.004:
-        checks.append(f"文字/表格黑色像素不足({dark_ratio:.4f})")
+        checks.append(f"AI最终图问题：文字/表格黑色像素不足({dark_ratio:.4f})")
     if non_white_ratio < 0.05:
-        checks.append(f"图片过白或内容过少({non_white_ratio:.4f})")
+        checks.append(f"AI最终图问题：图片过白或内容过少({non_white_ratio:.4f})")
 
     if checks:
         return False, "；".join(checks)
     return True, f"通过({width}x{height}, red={red_ratio:.4f}, dark={dark_ratio:.4f})"
+
+
+def _find_paper_bbox(img: Image.Image) -> tuple[int, int, int, int] | None:
+    """识别最终图里的白纸主体，避免把亮桌面/高光当成纸张边界。"""
+    rgb = img.convert("RGB")
+    width, height = rgb.size
+    step = 4 if max(width, height) <= 2400 else 6
+    grid_w = (width + step - 1) // step
+    grid_h = (height + step - 1) // step
+    white: set[tuple[int, int]] = set()
+    for gy in range(grid_h):
+        y = min(height - 1, gy * step)
+        for gx in range(grid_w):
+            x = min(width - 1, gx * step)
+            r, g, b = rgb.getpixel((x, y))
+            if r >= 218 and g >= 218 and b >= 218 and max(r, g, b) - min(r, g, b) <= 30:
+                white.add((gx, gy))
+    if not white:
+        return None
+
+    visited: set[tuple[int, int]] = set()
+    components: list[tuple[int, int, int, int, int]] = []
+    for seed in list(white):
+        if seed in visited:
+            continue
+        stack = [seed]
+        visited.add(seed)
+        min_gx = max_gx = seed[0]
+        min_gy = max_gy = seed[1]
+        count = 0
+        while stack:
+            gx, gy = stack.pop()
+            count += 1
+            min_gx = min(min_gx, gx)
+            max_gx = max(max_gx, gx)
+            min_gy = min(min_gy, gy)
+            max_gy = max(max_gy, gy)
+            for nx, ny in ((gx + 1, gy), (gx - 1, gy), (gx, gy + 1), (gx, gy - 1)):
+                point = (nx, ny)
+                if point in white and point not in visited:
+                    visited.add(point)
+                    stack.append(point)
+        components.append((count, min_gx, min_gy, max_gx, max_gy))
+
+    min_area = max(800, int((grid_w * grid_h) * 0.035))
+    candidates: list[tuple[float, int, int, int, int, int]] = []
+    for count, min_gx, min_gy, max_gx, max_gy in components:
+        box_w = (max_gx - min_gx + 1) * step
+        box_h = (max_gy - min_gy + 1) * step
+        if count < min_area or box_w < width * 0.35 or box_h < height * 0.35:
+            continue
+        fill_ratio = count / max(1, (max_gx - min_gx + 1) * (max_gy - min_gy + 1))
+        if fill_ratio < 0.22:
+            continue
+        center_x = ((min_gx + max_gx + 1) * step) / 2
+        center_y = ((min_gy + max_gy + 1) * step) / 2
+        center_penalty = abs(center_x - width / 2) / max(1, width) + abs(center_y - height / 2) / max(1, height)
+        score = count - center_penalty * count * 0.4
+        candidates.append((score, count, min_gx, min_gy, max_gx, max_gy))
+    if not candidates:
+        return None
+
+    _, _, min_gx, min_gy, max_gx, max_gy = max(candidates, key=lambda item: item[0])
+    x0 = max(0, min_gx * step)
+    y0 = max(0, min_gy * step)
+    x1 = min(width - 1, (max_gx + 1) * step - 1)
+    y1 = min(height - 1, (max_gy + 1) * step - 1)
+    return x0, y0, x1, y1
 
 
 def _make_paper_photo(image_path: str, seed: int = 20260530) -> Image.Image:
@@ -244,6 +419,282 @@ def _make_paper_photo(image_path: str, seed: int = 20260530) -> Image.Image:
     result.alpha_composite(shadow)
     result.paste(rotated.convert("RGBA"), (x, y), alpha)
     return result.convert("RGB")
+
+
+def _generate_stable_template_photo(
+    docx_image_path: str,
+    stamp_image_path: str,
+    output_dir: str,
+    sub_name: str,
+    episode_count: int,
+    total_min: int,
+    api_key: str | None = None,
+    api_base_url: str | None = None,
+    image_model: str | None = None,
+    log_cb=None,
+) -> Image.Image:
+    """新版稳定方案：AI 生成空桌面背景，本地合成清晰纸张内容。"""
+    def log(msg):
+        if log_cb:
+            log_cb(msg)
+
+    try:
+        docx_img = Image.open(docx_image_path).convert("RGB")
+        stamp_assets = _extract_stamp_assets(stamp_image_path, output_dir, log)
+        if stamp_assets:
+            stable_paper = _apply_stamp_assets_to_docx(docx_img, stamp_assets)
+            log("  已使用印章素材图抠章并贴到 Word 成本表")
+        else:
+            stable_paper = _merge_images(docx_img, stamp_image_path)
+        paper_path = os.path.join(output_dir, "_stable_paper_input.jpg")
+        stable_paper.save(paper_path, "JPEG", quality=96)
+        log(f"  已生成稳定纸张输入: {paper_path}")
+    except Exception as exc:
+        log(f"  稳定纸张合成失败，改用模板填字输入: {exc}")
+        paper_path = _fill_stamp_template(
+            stamp_image_path=stamp_image_path,
+            output_dir=output_dir,
+            sub_name=sub_name,
+            episode_count=episode_count,
+            total_min=total_min,
+            log=log,
+        )
+        if not paper_path:
+            paper_path = docx_image_path
+
+    log("  请求 AI 生成空白木桌手机拍摄背景...")
+    background = _ai_generate_table_background(
+        api_key=api_key,
+        api_base_url=api_base_url,
+        image_model=image_model,
+        log_cb=log,
+    )
+    background_path = os.path.join(output_dir, "_ai_table_background.jpg")
+    background.save(background_path, "JPEG", quality=94)
+    log(f"  已保存 AI 桌面背景: {background_path}")
+
+    log("  本地贴入清晰成本表并添加手机拍摄质感...")
+    return _compose_paper_on_background(paper_path, background, seed=20260605)
+
+
+def _ai_generate_table_background(
+    api_key: str | None = None,
+    api_base_url: str | None = None,
+    image_model: str | None = None,
+    log_cb=None,
+) -> Image.Image:
+    """只让 AI 生成无文字、无纸张的竖版桌面背景。API 不可用时直接报错。"""
+    def log(msg):
+        if log_cb:
+            log_cb(msg)
+
+    api_key = api_key or ""
+    if not api_key:
+        raise RuntimeError("未配置图片 API Key，无法生成 AI 桌面背景")
+
+    api_base_url = _normalize_api_base_url(api_base_url)
+    image_model = image_model or IMAGE_MODEL
+    prompt = (
+        "生成一张手机竖拍 3:4 画幅的真实照片背景：浅色木纹桌面，干净自然，"
+        "没有纸张，没有文字，没有印章，没有水印，没有任何物品。"
+        "桌面纹理连续、光线柔和，有轻微真实镜头明暗变化，适合后期放置一张 A4 白纸。"
+    )
+    if is_ark_image_api(api_base_url):
+        img = generate_ark_image(
+            session=_session,
+            api_base_url=api_base_url,
+            api_key=api_key,
+            model=image_model,
+            prompt=prompt,
+            image_paths=None,
+            size="2K",
+            response_format="url",
+            output_format="png",
+            watermark=False,
+            sequential_image_generation="disabled",
+            stream=False,
+            timeout=300,
+        )
+        log("  AI 桌面背景生成完成")
+        return _fit_background_canvas(img)
+
+    if is_dashscope_api(api_base_url):
+        img = generate_dashscope_image(
+            session=_session,
+            api_base_url=api_base_url,
+            api_key=api_key,
+            model=image_model,
+            prompt=prompt,
+            image_paths=None,
+            size="1536*2048",
+            n=1,
+            timeout=300,
+            negative_prompt="纸张，文字，印章，水印，人物，手，键盘，杯子，杂物，边框",
+            prompt_extend=False,
+            watermark=False,
+        )
+        log("  AI 桌面背景生成完成")
+        return _fit_background_canvas(img)
+
+    raise RuntimeError(f"当前生图 API 地址暂不支持稳定版桌面背景生成: {api_base_url}")
+
+
+def _fit_background_canvas(img: Image.Image, target_w: int = 1200, target_h: int = 1600) -> Image.Image:
+    img = img.convert("RGB")
+    src_w, src_h = img.size
+    scale = max(target_w / src_w, target_h / src_h)
+    resized = img.resize((int(src_w * scale), int(src_h * scale)), Image.LANCZOS)
+    x = (resized.width - target_w) // 2
+    y = (resized.height - target_h) // 2
+    cropped = resized.crop((x, y, x + target_w, y + target_h))
+    cropped = _enhance_wood_grain(cropped)
+    # 背景过亮时会被纸张检测误识别成白纸边界，轻微压暗更像真实桌面。
+    cropped = ImageEnhance.Brightness(cropped).enhance(0.86)
+    cropped = ImageEnhance.Color(cropped).enhance(0.95)
+    return cropped
+
+
+def _compose_paper_on_background(
+    paper_path: str,
+    background: Image.Image,
+    seed: int = 20260605,
+) -> Image.Image:
+    bg = background.convert("RGB")
+    target_w, target_h = bg.size
+    paper = Image.open(paper_path).convert("RGB")
+
+    max_paper_w = int(target_w * 0.84)
+    max_paper_h = int(target_h * 0.90)
+    scale = min(max_paper_w / paper.width, max_paper_h / paper.height)
+    paper_w = int(paper.width * scale)
+    paper_h = int(paper.height * scale)
+    paper = paper.resize((paper_w, paper_h), Image.LANCZOS)
+    paper = _add_paper_texture(paper, seed + 1)
+
+    rng = random.Random(seed)
+    base_x = (target_w - paper_w) // 2 + rng.randint(-10, 10)
+    base_y = (target_h - paper_h) // 2 + rng.randint(-8, 8)
+
+    # 轻微透视：上边略窄、下边略宽，像手机近距离俯拍文件。
+    top_inset = int(paper_w * rng.uniform(0.012, 0.026))
+    bottom_out = int(paper_w * rng.uniform(0.006, 0.018))
+    left_tilt = int(paper_h * rng.uniform(-0.006, 0.006))
+    right_tilt = int(paper_h * rng.uniform(-0.006, 0.006))
+    dest = [
+        (base_x + top_inset, base_y + left_tilt),
+        (base_x + paper_w - top_inset, base_y + right_tilt),
+        (base_x + paper_w + bottom_out, base_y + paper_h - right_tilt),
+        (base_x - bottom_out, base_y + paper_h - left_tilt),
+    ]
+    dest = _clamp_quad(dest, target_w, target_h, margin=48)
+
+    warped = _warp_rgba_to_canvas(paper.convert("RGBA"), dest, (target_w, target_h))
+    alpha = warped.getchannel("A")
+
+    result = bg.convert("RGBA")
+    shadow = Image.new("RGBA", result.size, (0, 0, 0, 0))
+    shadow_mask = alpha.filter(ImageFilter.GaussianBlur(28))
+    shadow_layer = Image.new("RGBA", result.size, (0, 0, 0, 70))
+    shadow.paste(shadow_layer, (18, 24), shadow_mask)
+    result.alpha_composite(shadow)
+    result.alpha_composite(warped)
+
+    return _apply_camera_photo_effect(result.convert("RGB"), seed=seed + 3)
+
+
+def _clamp_quad(points: list[tuple[int, int]], width: int, height: int, margin: int) -> list[tuple[int, int]]:
+    return [
+        (max(margin, min(width - margin, x)), max(margin, min(height - margin, y)))
+        for x, y in points
+    ]
+
+
+def _warp_rgba_to_canvas(
+    src: Image.Image,
+    dest_points: list[tuple[int, int]],
+    canvas_size: tuple[int, int],
+) -> Image.Image:
+    src = src.convert("RGBA")
+    src_points = [(0, 0), (src.width, 0), (src.width, src.height), (0, src.height)]
+    coeffs = _find_perspective_coeffs(dest_points, src_points)
+    return src.transform(
+        canvas_size,
+        Image.Transform.PERSPECTIVE,
+        coeffs,
+        Image.Resampling.BICUBIC,
+        fillcolor=(0, 0, 0, 0),
+    )
+
+
+def _find_perspective_coeffs(pa, pb):
+    matrix = []
+    for p1, p2 in zip(pa, pb):
+        matrix.append([p1[0], p1[1], 1, 0, 0, 0, -p2[0] * p1[0], -p2[0] * p1[1]])
+        matrix.append([0, 0, 0, p1[0], p1[1], 1, -p2[1] * p1[0], -p2[1] * p1[1]])
+    vector = [coord for point in pb for coord in point]
+    return tuple(_solve_linear_system(matrix, vector))
+
+
+def _solve_linear_system(matrix: list[list[float]], vector: list[float]) -> list[float]:
+    """Solve an 8x8 system with Gaussian elimination to avoid bundling numpy."""
+    size = len(vector)
+    aug = [list(map(float, row)) + [float(vector[i])] for i, row in enumerate(matrix)]
+    for col in range(size):
+        pivot = max(range(col, size), key=lambda row: abs(aug[row][col]))
+        if abs(aug[pivot][col]) < 1e-12:
+            raise RuntimeError("透视变换计算失败：纸张四角坐标异常")
+        aug[col], aug[pivot] = aug[pivot], aug[col]
+        pivot_val = aug[col][col]
+        for j in range(col, size + 1):
+            aug[col][j] /= pivot_val
+        for row in range(size):
+            if row == col:
+                continue
+            factor = aug[row][col]
+            if abs(factor) < 1e-12:
+                continue
+            for j in range(col, size + 1):
+                aug[row][j] -= factor * aug[col][j]
+    return [aug[i][size] for i in range(size)]
+
+
+def _apply_camera_photo_effect(img: Image.Image, seed: int) -> Image.Image:
+    img = img.convert("RGB")
+    width, height = img.size
+    rng = random.Random(seed)
+
+    softened = img.filter(ImageFilter.GaussianBlur(0.16))
+    img = Image.blend(img, softened, 0.06)
+    img = ImageEnhance.Contrast(img).enhance(1.02)
+    img = ImageEnhance.Brightness(img).enhance(0.99)
+    return img
+
+
+def _crop_white_document(img: Image.Image) -> Image.Image:
+    """裁掉模板图四周多余白边，让纸张本体更适合贴到桌面。"""
+    rgb = img.convert("RGB")
+    width, height = rgb.size
+    px = rgb.load()
+    xs: list[int] = []
+    ys: list[int] = []
+    step = max(1, min(width, height) // 900)
+    for y in range(0, height, step):
+        for x in range(0, width, step):
+            r, g, b = px[x, y]
+            if min(r, g, b) < 245:
+                xs.append(x)
+                ys.append(y)
+    if not xs or not ys:
+        return rgb
+    pad_x = int(width * 0.045)
+    pad_y = int(height * 0.045)
+    x0 = max(0, min(xs) - pad_x)
+    y0 = max(0, min(ys) - pad_y)
+    x1 = min(width, max(xs) + pad_x)
+    y1 = min(height, max(ys) + pad_y)
+    if x1 - x0 < width * 0.45 or y1 - y0 < height * 0.45:
+        return rgb
+    return rgb.crop((x0, y0, x1, y1))
 
 
 def _make_wood_background(width: int, height: int) -> Image.Image:
@@ -376,11 +827,27 @@ def _fill_docx(template_path: str | Path, sub_name: str, episode_count: int, tot
     run.font.name = "仿宋_GB2312"
     run.font.size = 177800
 
+    _fill_docx_today_date(doc)
+
     # 保存到临时文件
     tmp = tempfile.NamedTemporaryFile(suffix=".docx", delete=False)
     doc.save(tmp.name)
     tmp.close()
     return tmp.name
+
+
+def _fill_docx_today_date(doc: Document) -> None:
+    """把模板底部日期填成当天日期。"""
+    today = date.today()
+    date_text = f"{today.year}年{today.month}月{today.day}日"
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if "年" in text and "月" in text and "日" in text:
+            para.clear()
+            run = para.add_run(f"                              {date_text}")
+            run.font.name = "仿宋_GB2312"
+            run.font.size = 177800
+            break
 
 
 # ============================================================
@@ -411,11 +878,13 @@ def _docx_to_image(docx_path: str, log_cb=None) -> Image.Image:
 
 
 def _convert_docx_to_pdf_with_timeout(docx_path: str, pdf_path: str, timeout_sec: int = 90) -> None:
-    """用 docx2pdf/Word 转 PDF；Word 卡住时超时失败，不切换兜底。"""
+    """优先用原生 Word COM 转 PDF；Word 卡住时超时失败，不切换低保真兜底。"""
     result_queue: queue.Queue[tuple[bool, BaseException | None]] = queue.Queue(maxsize=1)
 
     def worker() -> None:
         pythoncom = None
+        word = None
+        doc = None
         try:
             try:
                 import pythoncom as _pythoncom
@@ -424,12 +893,36 @@ def _convert_docx_to_pdf_with_timeout(docx_path: str, pdf_path: str, timeout_sec
             except Exception:
                 pythoncom = None
 
-            from docx2pdf import convert
-            convert(docx_path, pdf_path)
+            try:
+                import win32com.client
+
+                wd_export_format_pdf = 17
+                word = win32com.client.DispatchEx("Word.Application")
+                word.Visible = False
+                word.DisplayAlerts = 0
+                doc = word.Documents.Open(str(Path(docx_path).resolve()))
+                doc.ExportAsFixedFormat(
+                    OutputFileName=str(Path(pdf_path).resolve()),
+                    ExportFormat=wd_export_format_pdf,
+                )
+            except Exception:
+                from docx2pdf import convert
+
+                convert(docx_path, pdf_path)
             result_queue.put((True, None))
         except BaseException as exc:
             result_queue.put((False, exc))
         finally:
+            if doc is not None:
+                try:
+                    doc.Close(False)
+                except Exception:
+                    pass
+            if word is not None:
+                try:
+                    word.Quit()
+                except Exception:
+                    pass
             if pythoncom is not None:
                 try:
                     pythoncom.CoUninitialize()
@@ -543,8 +1036,8 @@ def _pdf_to_image(pdf_path: str) -> Image.Image:
 
 def _merge_images(docx_img: Image.Image, stamp_image_path: str) -> Image.Image:
     """
-    上半部分取 docx 生成的清晰图片，下半部分取图2.jpg 的印章区域。
-    以图片高度的 65% 作为分割点。
+    上半部分取 docx 生成的清晰图片，下半部分取模板图的完整报审机构/印章区域。
+    切点放在正文承诺文字之后，避免截断圆形公章。
     """
     stamp_img = Image.open(stamp_image_path)
 
@@ -557,20 +1050,200 @@ def _merge_images(docx_img: Image.Image, stamp_image_path: str) -> Image.Image:
         ratio = target_width / stamp_img.width
         stamp_img = stamp_img.resize((target_width, int(stamp_img.height * ratio)), Image.LANCZOS)
 
-    # 分割点：docx 图片的 65% 处
-    split_y = int(docx_img.height * 0.65)
-    final_height = split_y + (stamp_img.height - int(stamp_img.height * 0.65))
+    stamp_split_y = _find_stamp_region_top(stamp_img)
+    split_y = int(docx_img.height * (stamp_split_y / max(1, stamp_img.height)))
+    final_height = split_y + (stamp_img.height - stamp_split_y)
 
     merged = Image.new("RGB", (target_width, final_height), (255, 255, 255))
     # 上半部分：docx 图片
     top_crop = docx_img.crop((0, 0, target_width, split_y))
     merged.paste(top_crop, (0, 0))
-    # 下半部分：图2.jpg 的印章区域
-    stamp_split_y = int(stamp_img.height * 0.65)
+    # 下半部分：模板图的报审机构、印章、签名章、日期区域
     bottom_crop = stamp_img.crop((0, stamp_split_y, target_width, stamp_img.height))
     merged.paste(bottom_crop, (0, split_y))
 
     return merged
+
+
+def _find_stamp_region_top(stamp_img: Image.Image) -> int:
+    """根据红色印章像素定位底部盖章区域顶部，避免固定切点截断圆章。"""
+    rgb = stamp_img.convert("RGB")
+    width, height = rgb.size
+    red_points: list[tuple[int, int]] = []
+    step = max(1, min(width, height) // 900)
+    px = rgb.load()
+    for y in range(int(height * 0.35), height, step):
+        for x in range(0, width, step):
+            r, g, b = px[x, y]
+            if r > 135 and g < 120 and b < 120 and r - max(g, b) > 45:
+                red_points.append((x, y))
+    if not red_points:
+        return int(height * 0.54)
+    top_red = min(y for _, y in red_points)
+    padding = int(height * 0.055)
+    return max(int(height * 0.48), top_red - padding)
+
+
+def _extract_stamp_assets(
+    stamp_image_path: str,
+    output_dir: str,
+    log,
+) -> dict[str, Image.Image] | None:
+    """从横向白底印章素材图中按左中右抠出：公章、签名、法人章。"""
+    try:
+        src = Image.open(stamp_image_path).convert("RGB")
+    except Exception as exc:
+        log(f"  印章素材读取失败: {exc}")
+        return None
+
+    width, height = src.size
+    if width < height * 1.25:
+        return None
+
+    segments = {
+        "company_seal": (0, int(width * 0.40)),
+        "signature": (int(width * 0.36), int(width * 0.66)),
+        "name_seal": (int(width * 0.62), width),
+    }
+    assets: dict[str, Image.Image] = {}
+    for name, (x0, x1) in segments.items():
+        crop = src.crop((x0, 0, x1, height))
+        if name == "signature":
+            asset = _extract_dark_asset(crop)
+        else:
+            asset = _extract_red_asset(crop)
+        if asset is None:
+            return None
+        assets[name] = asset
+        try:
+            asset.save(os.path.join(output_dir, f"_asset_{name}.png"))
+        except Exception:
+            pass
+    return assets
+
+
+def _extract_red_asset(img: Image.Image) -> Image.Image | None:
+    return _extract_color_asset(
+        img,
+        lambda r, g, b: r > 130 and g < 145 and b < 145 and r - max(g, b) > 35,
+        expand=18,
+        alpha_blur=0.45,
+    )
+
+
+def _extract_dark_asset(img: Image.Image) -> Image.Image | None:
+    return _extract_color_asset(
+        img,
+        lambda r, g, b: max(r, g, b) < 145 and max(r, g, b) - min(r, g, b) < 80,
+        expand=14,
+        alpha_blur=0.35,
+    )
+
+
+def _extract_color_asset(img: Image.Image, predicate, expand: int, alpha_blur: float) -> Image.Image | None:
+    rgb = img.convert("RGB")
+    width, height = rgb.size
+    px = rgb.load()
+    xs: list[int] = []
+    ys: list[int] = []
+    mask = Image.new("L", (width, height), 0)
+    mask_px = mask.load()
+    for y in range(height):
+        for x in range(width):
+            r, g, b = px[x, y]
+            if predicate(r, g, b):
+                xs.append(x)
+                ys.append(y)
+                mask_px[x, y] = 255
+    if len(xs) < 80:
+        return None
+    x0 = max(0, min(xs) - expand)
+    y0 = max(0, min(ys) - expand)
+    x1 = min(width, max(xs) + expand)
+    y1 = min(height, max(ys) + expand)
+    cropped_rgb = rgb.crop((x0, y0, x1, y1))
+    cropped_mask = mask.crop((x0, y0, x1, y1)).filter(ImageFilter.GaussianBlur(alpha_blur))
+    asset = cropped_rgb.convert("RGBA")
+    asset.putalpha(cropped_mask)
+    return asset
+
+
+def _apply_stamp_assets_to_docx(docx_img: Image.Image, assets: dict[str, Image.Image]) -> Image.Image:
+    """把抠出的三件套贴到 Word 转出的完整成本表底部固定位置。"""
+    paper = docx_img.convert("RGBA")
+    width, height = paper.size
+
+    company = _resize_asset(assets["company_seal"], int(width * 0.165))
+    name_seal = _resize_asset(assets["name_seal"], int(width * 0.082))
+    signature = _resize_asset(assets["signature"], int(width * 0.115))
+
+    # 三件套按 Word 模板底部文字行定位：
+    # 公章压在“报审机构”右侧，签名贴在“法人代表/总编辑”冒号右侧，法人章紧跟签名右边。
+    company_x = int(width * 0.525)
+    company_y = int(height * 0.535)
+    sig_x = int(width * 0.505)
+    sig_y = int(height * 0.674)
+    name_x = int(width * 0.670)
+    name_y = int(height * 0.664)
+
+    _paste_rgba(paper, company, company_x, company_y, opacity=0.92)
+    sig_x, sig_y = _avoid_dark_text_overlap(paper, signature, sig_x, sig_y)
+    name_x = max(name_x, sig_x + signature.width + int(width * 0.02))
+    _paste_rgba(paper, signature, sig_x, sig_y, opacity=0.96)
+    _paste_rgba(paper, name_seal, name_x, name_y, opacity=0.94)
+    return paper.convert("RGB")
+
+
+def _resize_asset(asset: Image.Image, target_w: int) -> Image.Image:
+    asset = asset.convert("RGBA")
+    scale = target_w / max(1, asset.width)
+    target_h = max(1, int(asset.height * scale))
+    return asset.resize((target_w, target_h), Image.LANCZOS)
+
+
+def _paste_rgba(base: Image.Image, overlay: Image.Image, x: int, y: int, opacity: float = 1.0) -> None:
+    overlay = overlay.convert("RGBA")
+    if opacity < 1:
+        alpha = overlay.getchannel("A").point(lambda a: int(a * opacity))
+        overlay.putalpha(alpha)
+    base.alpha_composite(overlay, (x, y))
+
+
+def _avoid_dark_text_overlap(base: Image.Image, overlay: Image.Image, x: int, y: int) -> tuple[int, int]:
+    """Move signature slightly until its visible pixels do not cover existing black text."""
+    base_rgb = base.convert("RGB")
+    overlay_alpha = overlay.convert("RGBA").getchannel("A")
+    width, height = base_rgb.size
+    candidates: list[tuple[int, int]] = []
+    for dy in (0, 14, 28, 42, 56, -14):
+        for dx in (0, 18, 36, 54, 72, 90):
+            candidates.append((x + dx, y + dy))
+
+    best = (x, y)
+    best_score = None
+    for cx, cy in candidates:
+        if cx < 0 or cy < 0 or cx + overlay.width >= width or cy + overlay.height >= height:
+            continue
+        score = _dark_overlap_score(base_rgb, overlay_alpha, cx, cy)
+        if best_score is None or score < best_score:
+            best_score = score
+            best = (cx, cy)
+        if score == 0:
+            return cx, cy
+    return best
+
+
+def _dark_overlap_score(base: Image.Image, alpha: Image.Image, x: int, y: int) -> int:
+    score = 0
+    step = max(1, min(alpha.size) // 120)
+    for ay in range(0, alpha.height, step):
+        for ax in range(0, alpha.width, step):
+            if alpha.getpixel((ax, ay)) < 35:
+                continue
+            r, g, b = base.getpixel((x + ax, y + ay))
+            if max(r, g, b) < 120:
+                score += 1
+    return score
 
 
 def _fill_stamp_template(
@@ -723,14 +1396,73 @@ def _ai_fuse_template_photo(
         "6. 中下部承诺文字按第一张 docx 图保留，文字清晰、中文不乱码。\n"
         f"7. 底部必须融合第二张模板图中的红色圆形公章、红色方章/签名章、法定代表人或总编辑签名、日期位置。{company_instruction}\n"
         "8. 所有文字、表格线、印章都要像同一张纸上真实打印/盖章形成的内容，不能出现灰色擦除块、局部贴图边界、上下拼接线、重影、错位。\n"
-        "9. 纸张放在浅色木纹桌面上，俯拍略带透视，纸张上边缘略远、下边缘略近，有自然阴影、轻微纸张纹理和真实手机拍摄感，画面干净，只保留纸和桌面，纸张四个角都要露出来。\n"
-        "10. 不要生成新的印章，不要参考任何其他印章样式，所有红章、签名章和章中文字必须以第二张模板图为准。\n"
+        "9. 纸张放在浅色木纹桌面上，俯拍略带透视，有自然阴影、轻微纸张纹理和真实手机拍摄感，画面干净，只保留纸和桌面。\n"
+        "10. 整张 A4 纸必须完整入镜，四个角都要清楚露出来，四边都要留出一定桌面边距，不能有任何一个角被裁切、挡住或贴边。\n"
+        "11. 最终构图必须是 9:16 竖版手机拍照画面，不要正方形，不要横版；纸张在竖版桌面画面中完整居中，整体只有非常轻微的真实镜头柔化感，但文字、表格线和印章仍然清晰可辨。\n"
+        "12. 左右两侧只能是同一张浅色木纹桌面自然延续，绝对不要出现浅色竖条、相框边、拼接边、卷边背景、装饰边框或与桌面纹理不一致的边带。\n"
+        "13. 不要生成新的印章，不要参考任何其他印章样式，所有红章、签名章和章中文字必须以第二张模板图为准。\n"
     )
 
     paths = [docx_image_path, stamp_image_path]
     for path in paths:
         if not os.path.exists(path):
             raise FileNotFoundError(f"AI 融合输入图不存在: {path}")
+
+    if is_ark_image_api(api_base_url):
+        log(f"  请求火山方舟 {image_model} 多图融合...")
+        img = generate_ark_image(
+            session=_session,
+            api_base_url=api_base_url,
+            api_key=api_key,
+            model=image_model,
+            prompt=prompt,
+            image_paths=paths,
+            size="2K",
+            response_format="url",
+            output_format="png",
+            watermark=True,
+            sequential_image_generation="disabled",
+            stream=False,
+            timeout=300,
+        )
+        log("  火山方舟 AI 融合完成")
+        return img
+
+    if is_dashscope_api(api_base_url):
+        log(f"  请求阿里云百炼 {image_model} 多图融合...")
+        img = generate_dashscope_image(
+            session=_session,
+            api_base_url=api_base_url,
+            api_key=api_key,
+            model=image_model,
+            prompt=prompt,
+            image_paths=paths,
+            size="1536*2048",
+            n=1,
+            timeout=300,
+            negative_prompt="模糊文字，错别字，错位印章，额外印章，电子界面元素，拼接痕迹，灰色遮挡块，浮水印",
+            prompt_extend=False,
+            watermark=False,
+        )
+        log("  阿里云百炼 AI 融合完成")
+        return img
+
+    # 如需切回 OpenRouter，可恢复下面这段分支逻辑。
+    # if is_openrouter_api(api_base_url):
+    #     log(f"  请求 {api_base_url}/chat/completions ...")
+    #     img = generate_openrouter_image(
+    #         session=_session,
+    #         api_base_url=api_base_url,
+    #         api_key=api_key,
+    #         model=image_model,
+    #         prompt=prompt,
+    #         image_paths=paths,
+    #         aspect_ratio="2:3",
+    #         image_size="1K",
+    #         timeout=300,
+    #     )
+    #     log("  OpenRouter AI 融合完成")
+    #     return img
 
     files = []
     handles = []
@@ -791,16 +1523,110 @@ def _decode_image_response(response: requests.Response) -> Image.Image:
     raise RuntimeError(f"AI 返回图片格式不支持: {list(first.keys())}")
 
 
-def _ensure_min_report_size(img: Image.Image) -> Image.Image:
-    """AI 结果只做尺寸放大，不改内容；确保后续上传审查有足够分辨率。"""
+def _ensure_min_report_size(img: Image.Image, normalize_side_bg: bool = False) -> Image.Image:
+    """只保留很轻的柔滑和拍照感，不再扩边或重构背景。"""
     img = img.convert("RGB")
-    min_w, min_h = 1440, 2048
-    if img.width >= min_w and img.height >= min_h:
+    softened = img.filter(ImageFilter.GaussianBlur(0.35))
+    img = Image.blend(img, softened, 0.18)
+    if normalize_side_bg:
+        img = _normalize_side_background(img)
+    return img
+
+
+def _normalize_side_background(img: Image.Image) -> Image.Image:
+    """修掉左右两侧与桌面木纹明显不一致的竖边，让背景更像一整块桌面。"""
+    img = img.convert("RGB")
+    width, height = img.size
+    if width < 600 or height < 800:
         return img
 
-    scale = max(min_w / img.width, min_h / img.height)
-    new_size = (math.ceil(img.width * scale), math.ceil(img.height * scale))
-    return img.resize(new_size, Image.LANCZOS)
+    paper_bbox = _find_paper_bbox(img)
+    if paper_bbox is None:
+        return img
+
+    x0, y0, x1, y1 = paper_bbox
+    left_gap = x0
+    right_gap = width - 1 - x1
+    scan_w = min(max(48, int(width * 0.07)), max(1, left_gap), max(1, right_gap))
+    if scan_w < 32:
+        return img
+
+    ref_band = _extract_top_wood_reference(img, paper_bbox)
+    if ref_band is None:
+        return img
+
+    left_edge = img.crop((0, 0, scan_w, height))
+    right_edge = img.crop((width - scan_w, 0, width, height))
+
+    left_ref = ref_band.resize((scan_w, ref_band.height), Image.LANCZOS)
+    right_ref = ref_band.transpose(Image.FLIP_LEFT_RIGHT).resize((scan_w, ref_band.height), Image.LANCZOS)
+
+    if _should_replace_side_strip(left_edge, left_ref):
+        _tile_strip_vertically(img, left_ref, 0, left_gap)
+    if _should_replace_side_strip(right_edge, right_ref):
+        _tile_strip_vertically(img, right_ref, width - right_gap, right_gap)
+    return img
+
+
+def _extract_top_wood_reference(
+    img: Image.Image,
+    paper_bbox: tuple[int, int, int, int],
+) -> Image.Image | None:
+    """从纸张上方中间区域提取真实木纹，避免把纸面或异常边框当作参考。"""
+    width, height = img.size
+    x0, y0, x1, y1 = paper_bbox
+    paper_w = max(1, x1 - x0 + 1)
+    top_h = min(max(48, int(height * 0.08)), max(0, y0 - 8))
+    if top_h < 24:
+        return None
+
+    ref_x0 = max(0, x0 + int(paper_w * 0.18))
+    ref_x1 = min(width, x1 - int(paper_w * 0.18))
+    if ref_x1 - ref_x0 < 120:
+        ref_x0 = max(0, int(width * 0.3))
+        ref_x1 = min(width, int(width * 0.7))
+    if ref_x1 - ref_x0 < 60:
+        return None
+    return img.crop((ref_x0, 0, ref_x1, top_h))
+
+
+def _should_replace_side_strip(edge: Image.Image, ref: Image.Image) -> bool:
+    """判断侧边区域是否像异常边框，而不是正常木纹桌面。"""
+    edge_stat = ImageStat.Stat(edge)
+    ref_stat = ImageStat.Stat(ref)
+    edge_mean = edge_stat.mean
+    ref_mean = ref_stat.mean
+    edge_std = edge_stat.stddev
+    ref_std = ref_stat.stddev
+
+    mean_diff = sum(abs(a - b) for a, b in zip(edge_mean, ref_mean)) / 3.0
+    std_gap = sum(max(0.0, a - b) for a, b in zip(edge_std, ref_std)) / 3.0
+    edge_brightness = sum(edge_mean) / 3.0
+    ref_brightness = sum(ref_mean) / 3.0
+
+    return (
+        mean_diff >= 12
+        or std_gap >= 10
+        or edge_brightness - ref_brightness >= 16
+    )
+
+
+def _tile_strip_vertically(base: Image.Image, strip: Image.Image, start_x: int, target_w: int) -> None:
+    """用上方真实木纹竖向平铺覆盖异常侧边。"""
+    if target_w <= 0:
+        return
+    strip_w, strip_h = strip.size
+    if strip_w <= 0 or strip_h <= 0:
+        return
+
+    fill_strip = strip.resize((target_w, strip_h), Image.LANCZOS)
+    y = 0
+    while y < base.height:
+        remaining = base.height - y
+        piece_h = min(strip_h, remaining)
+        piece = fill_strip.crop((0, 0, target_w, piece_h))
+        base.paste(piece, (start_x, y))
+        y += piece_h
 
 
 def _ai_naturalize(

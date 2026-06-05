@@ -26,9 +26,9 @@ DEFAULT_STAMP_IMAGE = SUCAI_DIR / "模板.jpg"
 
 # 默认 API 地址只预填服务地址，不预填任何 API Key。
 TEXT_API_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
-IMAGE_API_BASE_URL = "https://aheapi.com"
+IMAGE_API_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 TEXT_MODEL = "doubao-seed-2-0-lite-260428"
-IMAGE_MODEL = "gpt-image-2"
+IMAGE_MODEL = "doubao-seedream-5-0-260128"
 LICENSE_SERVER_URL = "http://124.220.63.163:8787"
 UPDATE_SERVER_URL = LICENSE_SERVER_URL
 
@@ -51,6 +51,7 @@ class AppConfig:
     browser_slow_mo_ms: int = 0
     upload_timeout_min: int = 60
     upload_poll_min: int = 2
+    close_delay_after_upload_sec: int = 60
     volc_api_key: str = ""
     api_base_url: str = TEXT_API_BASE_URL
     image_api_base_url: str = IMAGE_API_BASE_URL

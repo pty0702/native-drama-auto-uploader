@@ -23,13 +23,15 @@ for pkg in ("PIL", "lxml", "cryptography", "bcrypt",
 
 all_hiddenimports = playwright_hiddenimports + extra_hiddenimports
 
-# 数据文件：图标 + sucai 模板 + ffmpeg
-all_datas = [
-    ('app_icon.png', '.'),
-    ('sucai/视频.docx', 'sucai'),
-    ('sucai/模板.jpg', 'sucai'),
-    ('sucai/照片参考.png', 'sucai'),
-] + playwright_datas + extra_datas
+# 应用图标 + sucai 必需模板 + ffmpeg
+import os as _os
+
+shared_datas = [('app_icon.png', '.')]
+for _src in ('sucai/视频.docx', 'sucai/模板.jpg'):
+    if _os.path.exists(_src):
+        shared_datas.append((_src, 'sucai'))
+
+all_datas = shared_datas + playwright_datas + extra_datas
 
 # 额外二进制：ffmpeg / ffprobe 及其 DLL
 import glob as _glob

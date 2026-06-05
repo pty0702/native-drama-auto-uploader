@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from .models import NativeDramaTask, now_iso
-from .settings import QUEUE_PATH
+from .settings import PROJECT_DIR, QUEUE_PATH
 
 
 class QueueStore:
@@ -14,12 +14,28 @@ class QueueStore:
         if not self.path.exists():
             self.save([])
 
-    def load(self) -> list[NativeDramaTask]:
+    def _read_tasks(self) -> list[NativeDramaTask]:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except Exception:
             raw = []
         return [NativeDramaTask.from_dict(item) for item in raw]
+
+    def _folder_exists(self, task: NativeDramaTask) -> bool:
+        folder = Path(task.folder)
+        if folder.exists() and folder.is_dir():
+            return True
+        if not folder.is_absolute():
+            project_folder = PROJECT_DIR / folder
+            return project_folder.exists() and project_folder.is_dir()
+        return False
+
+    def load(self) -> list[NativeDramaTask]:
+        tasks = self._read_tasks()
+        valid_tasks = [task for task in tasks if self._folder_exists(task)]
+        if len(valid_tasks) != len(tasks):
+            self.save(valid_tasks)
+        return valid_tasks
 
     def save(self, tasks: list[NativeDramaTask]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
