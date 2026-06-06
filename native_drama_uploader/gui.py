@@ -59,21 +59,26 @@ from .updater import check_update, download_update, schedule_update_and_exit
 
 def license_remaining_text(status) -> str:
     """Format the verified license status for the main window title area."""
-    if not status:
-        return "授权未验证"
-    customer = (getattr(status, "customer", "") or "").strip()
-    expires_at = (getattr(status, "expires_at", "") or "").strip()
-    if not expires_at:
-        return f"{customer} · 永久授权" if customer else "授权有效"
-    expires_dt = parse_server_time(expires_at)
-    if not expires_dt:
-        suffix = f"有效期至 {expires_at}"
+    try:
+        if not status:
+            return "授权未验证"
+        customer = (getattr(status, "customer", "") or "").strip()
+        expires_at = (getattr(status, "expires_at", "") or "").strip()
+        if not expires_at:
+            return f"{customer} · 永久授权" if customer else "授权有效"
+        expires_dt = parse_server_time(expires_at)
+        if not expires_dt:
+            suffix = f"有效期至 {expires_at[:10]}" if len(expires_at) >= 10 else f"有效期至 {expires_at}"
+            return f"{customer} · {suffix}" if customer else suffix
+        now = datetime.now(timezone.utc)
+        days_left = max(0, (expires_dt.date() - now.date()).days)
+        # Some customer Windows environments raise OSError(22) when converting
+        # UTC datetimes to local time. Display the server UTC date directly.
+        date_text = expires_dt.strftime("%Y-%m-%d")
+        suffix = f"有效期至 {date_text}，剩余 {days_left} 天"
         return f"{customer} · {suffix}" if customer else suffix
-    now = datetime.now(timezone.utc)
-    days_left = max(0, (expires_dt.date() - now.date()).days)
-    date_text = expires_dt.astimezone().strftime("%Y-%m-%d")
-    suffix = f"有效期至 {date_text}，剩余 {days_left} 天"
-    return f"{customer} · {suffix}" if customer else suffix
+    except Exception:
+        return "授权有效"
 
 
 def license_title(status) -> str:
