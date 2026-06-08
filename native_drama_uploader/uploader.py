@@ -693,7 +693,7 @@ class WeChatNativeDramaUploader:
         all_uploaded = await self.wait_for_all_videos(task.episode_count)
         if not all_uploaded:
             raise RuntimeError(
-                f"剧集 {task.drama_name} 视频上传仍有失败（已重试3次），已跳过本剧"
+                f"剧集 {task.drama_name} 视频上传仍有失败（已重试6次），已跳过本剧"
             )
         if task.submit_after_upload:
             await self.confirm_submit()
@@ -707,7 +707,7 @@ class WeChatNativeDramaUploader:
         poll_interval = min(self.config.upload_poll_min * 60, 60)  # 轮询最多60秒一次
         poll_count = 0
         retry_count = 0
-        max_retries = 3
+        max_retries = 6
         while asyncio.get_running_loop().time() < deadline:
             poll_count += 1
             # 截图用于诊断，失败不影响流程

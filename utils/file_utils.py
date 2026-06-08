@@ -51,17 +51,10 @@ def _natural_file_key(path):
 
 
 def get_video_duration(video_path):
-    import subprocess
     try:
-        from core.video_processor import _get_ffprobe
+        from core.video_processor import _get_duration
 
-        ffprobe = _get_ffprobe()
-        result = subprocess.run(
-            [ffprobe, "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
-            capture_output=True, text=True, timeout=10
-        )
-        return float(result.stdout.strip())
+        return _get_duration(video_path)
     except Exception:
         return 0.0
 

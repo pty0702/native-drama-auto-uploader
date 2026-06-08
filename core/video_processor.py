@@ -3,6 +3,8 @@ import sys
 import shutil
 import subprocess
 import re
+import json
+import time
 from pathlib import Path
 
 from utils.md5_modifier import modify_md5
@@ -123,7 +125,7 @@ def _test_encoder_available(ffmpeg, encoder):
     ffmpeg -encoders 只能看到编译时支持，不能反映当前机器是否插了对应显卡。
     这里用 nullsrc 生成极小测试帧做一次真实编码。"""
     try:
-        subprocess.run(
+        result = subprocess.run(
             [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
              "-f", "lavfi", "-i", "nullsrc=s=32x32:d=0.1",
              "-frames:v", "1", "-c:v", encoder,
@@ -131,7 +133,7 @@ def _test_encoder_available(ffmpeg, encoder):
             capture_output=True, timeout=10,
             **_subprocess_no_window(),
         )
-        return True
+        return result.returncode == 0
     except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
         return False
     except Exception:
@@ -206,6 +208,7 @@ def process_videos(video_files, output_dir, sub_name, log_cb=None):
     os.makedirs(output_dir, exist_ok=True)
     results = []
     total_duration = 0.0
+    batch_started_at = time.perf_counter()
 
     ffmpeg = _get_ffmpeg()
     log(f"ffmpeg: {ffmpeg}")
@@ -220,26 +223,48 @@ def process_videos(video_files, output_dir, sub_name, log_cb=None):
 
     video_jobs = _build_video_jobs(video_files, output_dir, sub_name)
     for i, (vf, episode_num, output_path) in enumerate(video_jobs, 1):
+        item_started_at = time.perf_counter()
         basename = os.path.basename(vf)
         log(f"正在处理视频 {i}/{len(video_files)}: {basename}")
 
         output_name = os.path.basename(output_path)
 
-        duration = _get_duration(vf)
-        total_duration += duration
+        source_duration = _get_duration(vf)
 
-        _transcode(vf, output_path, ffmpeg, gpu_encoder)
+        _transcode(vf, output_path, ffmpeg, gpu_encoder, log_cb=log)
 
         modify_md5(output_path)
 
+        output_duration = _get_duration(output_path)
+        if output_duration <= 0:
+            output_duration = source_duration
+            log(f"  警告: 无法读取转码后时长，已回退使用源视频时长: {_format_duration_for_log(output_duration)}")
+        elif source_duration > 0 and abs(output_duration - source_duration) > 2:
+            log(
+                "  警告: 转码前后时长差异较大，成本表将按转码后成品时长计算: "
+                f"源视频 {_format_duration_for_log(source_duration)} -> "
+                f"成品 {_format_duration_for_log(output_duration)}"
+            )
+        total_duration += output_duration
+
+        elapsed = time.perf_counter() - item_started_at
         size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        log(f"  完成: {output_name} ({size_mb:.1f}MB, {int(duration//60)}分{int(duration%60)}秒)")
+        log(
+            f"  完成: {output_name} "
+            f"({size_mb:.1f}MB, 视频时长 {_format_duration_for_log(output_duration)}, "
+            f"转码耗时 {_format_duration_for_log(elapsed)})"
+        )
         results.append(output_path)
 
     if len(results) != len(video_files):
         raise RuntimeError(f"视频处理数量异常: 输入 {len(video_files)} 个，输出 {len(results)} 个")
 
-    log(f"视频处理全部完成: {len(results)}集, 总时长 {int(total_duration//60)}分{int(total_duration%60)}秒")
+    batch_elapsed = time.perf_counter() - batch_started_at
+    log(
+        f"视频处理全部完成: {len(results)}集, "
+        f"成品视频内容总时长 {_format_duration_for_log(total_duration)}, "
+        f"转码实际耗时 {_format_duration_for_log(batch_elapsed)}"
+    )
     return results, total_duration
 
 
@@ -272,27 +297,32 @@ def _build_video_jobs(video_files, output_dir, sub_name):
     return jobs
 
 
-def _transcode(input_path, output_path, ffmpeg, gpu_encoder):
+def _transcode(input_path, output_path, ffmpeg, gpu_encoder, log_cb=None):
     """转码为 H.264 4Mbps，保留原始分辨率。优先 GPU 编码，失败自动降级到 CPU。"""
+    def log(msg):
+        if log_cb:
+            log_cb(msg)
+
     if gpu_encoder:
         try:
             if gpu_encoder == "h264_nvenc":
-                _transcode_nvenc(input_path, output_path, ffmpeg)
+                _transcode_nvenc(input_path, output_path, ffmpeg, log_cb=log)
             elif gpu_encoder == "h264_amf":
-                _transcode_amf(input_path, output_path, ffmpeg)
+                _transcode_amf(input_path, output_path, ffmpeg, log_cb=log)
             return
         except subprocess.CalledProcessError:
-            print(f"GPU 编码失败 ({gpu_encoder})，自动降级到 CPU 编码")
+            log(f"GPU 编码失败 ({gpu_encoder})，自动降级到 CPU 编码")
             if os.path.exists(output_path):
                 os.remove(output_path)
 
     # 最终兜底：CPU 软件编码
-    _transcode_cpu(input_path, output_path, ffmpeg)
+    _transcode_cpu(input_path, output_path, ffmpeg, log_cb=log)
 
 
-def _transcode_nvenc(input_path, output_path, ffmpeg):
+def _transcode_nvenc(input_path, output_path, ffmpeg, log_cb=None):
     """NVIDIA NVENC: 全 GPU 管线（解码 + 编码均在 GPU），保留原始分辨率。"""
-    print("使用 NVENC GPU 硬件加速")
+    if log_cb:
+        log_cb("使用 NVENC GPU 硬件加速")
     cmd = [
         ffmpeg, "-y",
         "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
@@ -307,9 +337,10 @@ def _transcode_nvenc(input_path, output_path, ffmpeg):
                    **_subprocess_no_window())
 
 
-def _transcode_amf(input_path, output_path, ffmpeg):
+def _transcode_amf(input_path, output_path, ffmpeg, log_cb=None):
     """AMD AMF: D3D11VA 硬件解码 + GPU 编码，保留原始分辨率。"""
-    print("使用 AMD AMF GPU 硬件加速")
+    if log_cb:
+        log_cb("使用 AMD AMF GPU 硬件加速")
     cmd = [
         ffmpeg, "-y",
         "-hwaccel", "d3d11va",
@@ -324,9 +355,10 @@ def _transcode_amf(input_path, output_path, ffmpeg):
                    **_subprocess_no_window())
 
 
-def _transcode_cpu(input_path, output_path, ffmpeg):
+def _transcode_cpu(input_path, output_path, ffmpeg, log_cb=None):
     """CPU 软件编码 (libx264)，保留原始分辨率，作为 GPU 路径的最终兜底。"""
-    print("使用 CPU 软件编码 (libx264)")
+    if log_cb:
+        log_cb("使用 CPU 软件编码 (libx264)")
     cmd = [
         ffmpeg, "-y", "-i", input_path,
         "-c:v", "libx264", "-preset", "ultrafast",
@@ -346,6 +378,35 @@ def _get_duration(path):
         return 0.0
     if not ffprobe:
         return 0.0
+    # 优先读取视频流时长。部分素材的容器 format.duration 会被音频、
+    # edit-list 或错误元数据影响，成本表应按最终可见视频时长计算。
+    try:
+        r = subprocess.run(
+            [
+                ffprobe, "-v", "error",
+                "-show_entries", "stream=codec_type,duration:format=duration",
+                "-of", "json",
+                path,
+            ],
+            capture_output=True, text=True, timeout=10,
+            **_subprocess_no_window(),
+        )
+        data = json.loads(r.stdout or "{}")
+        stream_durations = []
+        for stream in data.get("streams", []):
+            if stream.get("codec_type") != "video":
+                continue
+            value = _safe_float(stream.get("duration"))
+            if value > 0:
+                stream_durations.append(value)
+        if stream_durations:
+            return max(stream_durations)
+        value = _safe_float(data.get("format", {}).get("duration"))
+        if value > 0:
+            return value
+    except Exception:
+        pass
+
     try:
         r = subprocess.run(
             [ffprobe, "-v", "error", "-show_entries", "format=duration",
@@ -353,9 +414,21 @@ def _get_duration(path):
             capture_output=True, text=True, timeout=10,
             **_subprocess_no_window(),
         )
-        return float(r.stdout.strip())
+        return _safe_float(r.stdout.strip())
     except Exception:
         return 0.0
+
+
+def _safe_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _format_duration_for_log(seconds):
+    total_seconds = max(0, int(round(seconds or 0)))
+    return f"{total_seconds // 60}分{total_seconds % 60}秒"
 
 
 def _extract_episode(filename):

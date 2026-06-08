@@ -27,6 +27,8 @@ all_hiddenimports = playwright_hiddenimports + extra_hiddenimports
 import os as _os
 
 shared_datas = [('app_icon.png', '.')]
+if _os.path.exists('app_icon.ico'):
+    shared_datas.append(('app_icon.ico', '.'))
 for _src in ('sucai/视频.docx', 'sucai/模板.jpg'):
     if _os.path.exists(_src):
         shared_datas.append((_src, 'sucai'))
@@ -76,6 +78,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='app_icon.ico' if _os.path.exists('app_icon.ico') else None,
 )
 coll = COLLECT(
     exe,

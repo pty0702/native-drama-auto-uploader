@@ -390,37 +390,6 @@ def _find_paper_bbox(img: Image.Image) -> tuple[int, int, int, int] | None:
     return x0, y0, x1, y1
 
 
-def _make_paper_photo(image_path: str, seed: int = 20260530) -> Image.Image:
-    """本地照片化：保留全部文字和印章，只添加木纹桌面、透视、阴影和纸张质感。"""
-    paper = Image.open(image_path).convert("RGB")
-    target_w, target_h = 1440, 2048
-    table = _make_wood_background(target_w, target_h)
-
-    # A4 竖纸放入 2K 竖版画布。
-    paper_h = 1880
-    paper_w = int(paper_h * paper.width / paper.height)
-    paper = paper.resize((paper_w, paper_h), Image.LANCZOS)
-    paper = _add_paper_texture(paper, seed + 1)
-
-    rng = random.Random(seed)
-    angle = rng.uniform(-1.4, -0.5)
-    rotated = paper.rotate(angle, expand=True, resample=Image.BICUBIC, fillcolor=(0, 0, 0))
-    alpha = Image.new("L", paper.size, 255).rotate(angle, expand=True, resample=Image.BICUBIC, fillcolor=0)
-
-    x = (target_w - rotated.width) // 2
-    y = (target_h - rotated.height) // 2 + rng.randint(10, 24)
-
-    shadow = Image.new("RGBA", table.size, (0, 0, 0, 0))
-    shadow_mask = alpha.filter(ImageFilter.GaussianBlur(28))
-    shadow_layer = Image.new("RGBA", rotated.size, (0, 0, 0, 82))
-    shadow.paste(shadow_layer, (x + 20, y + 24), shadow_mask)
-
-    result = table.convert("RGBA")
-    result.alpha_composite(shadow)
-    result.paste(rotated.convert("RGBA"), (x, y), alpha)
-    return result.convert("RGB")
-
-
 def _generate_stable_template_photo(
     docx_image_path: str,
     stamp_image_path: str,
@@ -695,46 +664,6 @@ def _crop_white_document(img: Image.Image) -> Image.Image:
     if x1 - x0 < width * 0.45 or y1 - y0 < height * 0.45:
         return rgb
     return rgb.crop((x0, y0, x1, y1))
-
-
-def _make_wood_background(width: int, height: int) -> Image.Image:
-    ref_path = _resolve_photo_reference()
-    if ref_path:
-        ref = Image.open(ref_path).convert("RGB")
-        # 只抽取参考图顶部木纹区域，避免把参考图里的白纸也当作背景带进来。
-        band_h = max(24, int(ref.height * 0.035))
-        band = ref.crop((0, 0, ref.width, band_h)).resize((width, band_h), Image.LANCZOS)
-        bg = Image.new("RGB", (width, height))
-        for y in range(0, height, band_h):
-            bg.paste(band, (0, y))
-        bg = bg.crop((0, 0, width, height))
-        return _enhance_wood_grain(bg)
-
-    bg = Image.new("RGB", (width, height), (204, 176, 127))
-    draw = ImageDraw.Draw(bg)
-    rng = random.Random(20260530)
-    for x in range(width):
-        wave = math.sin(x / 32.0) * 10 + math.sin(x / 103.0) * 22
-        base = 184 + int(wave)
-        color = (min(230, base + 28), min(205, base + 8), max(105, base - 56))
-        draw.line((x, 0, x, height), fill=color)
-    for _ in range(180):
-        x = rng.randint(0, width)
-        color = (145 + rng.randint(0, 35), 112 + rng.randint(0, 30), 66 + rng.randint(0, 22))
-        draw.line((x, 0, x + rng.randint(-8, 8), height), fill=color, width=rng.choice((1, 1, 2)))
-    return bg.filter(ImageFilter.GaussianBlur(1.0))
-
-
-def _resolve_photo_reference() -> str | None:
-    candidates = [
-        os.environ.get("RECREATE_WOOD_REFERENCE", ""),
-        str(SUCAI_DIR / "照片参考.png"),
-        str(SUCAI_DIR / "照片参考.jpg"),
-    ]
-    for candidate in candidates:
-        if candidate and os.path.exists(candidate):
-            return candidate
-    return None
 
 
 def _enhance_wood_grain(bg: Image.Image) -> Image.Image:

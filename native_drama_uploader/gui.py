@@ -11,7 +11,7 @@ from .qt_bootstrap import configure_qt_runtime
 configure_qt_runtime()
 
 from PyQt5.QtCore import Qt, QObject, QTimer, pyqtSignal
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QFont, QIcon
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -83,6 +83,15 @@ def license_remaining_text(status) -> str:
 
 def license_title(status) -> str:
     return f"ReCreate AI - {license_remaining_text(status)}"
+
+
+def load_app_icon() -> QIcon:
+    """加载应用图标，优先使用 ico，兼容开发环境和打包环境。"""
+    for name in ("app_icon.ico", "app_icon.png"):
+        icon_path = PROJECT_DIR / name
+        if icon_path.exists():
+            return QIcon(str(icon_path))
+    return QIcon()
 
 
 class Signals(QObject):
@@ -190,8 +199,8 @@ class ApiTestThread(threading.Thread):
                 self._test_text_api()
                 self.signals.api_test_finished.emit("文本大模型 API 测试成功，配置已保存")
             else:
-                self._test_image_api()
-                self.signals.api_test_finished.emit("生图 API 测试成功，配置已保存")
+                msg = self._test_image_api()
+                self.signals.api_test_finished.emit(msg)
         except Exception as exc:
             prefix = "文本" if self.kind == "text" else "生图"
             self.signals.api_test_failed.emit(f"{prefix}: {exc}")
@@ -217,7 +226,7 @@ class ApiTestThread(threading.Thread):
             temperature=0,
         )
 
-    def _test_image_api(self) -> None:
+    def _test_image_api(self) -> str:
         import requests
         from core.ark_image import generate_ark_image, is_ark_image_api
         from core.dashscope_image import generate_dashscope_image, is_dashscope_api
@@ -249,8 +258,7 @@ class ApiTestThread(threading.Thread):
             save_dir.mkdir(parents=True, exist_ok=True)
             save_path = save_dir / "gui_image_api_test.png"
             img.save(save_path)
-            self.signals.api_test_finished.emit(f"生图 API 测试成功，已保存: {save_path}")
-            return
+            return f"生图 API 测试成功，已保存: {save_path}"
         if is_dashscope_api(api_base):
             session = requests.Session()
             session.trust_env = False
@@ -270,8 +278,7 @@ class ApiTestThread(threading.Thread):
             save_dir.mkdir(parents=True, exist_ok=True)
             save_path = save_dir / "gui_image_api_test.png"
             img.save(save_path)
-            self.signals.api_test_finished.emit(f"生图 API 测试成功，已保存: {save_path}")
-            return
+            return f"生图 API 测试成功，已保存: {save_path}"
         if not api_base.endswith("/v1"):
             api_base = f"{api_base}/v1"
 
@@ -324,8 +331,7 @@ class ApiTestThread(threading.Thread):
 
             img_bytes = base64.b64decode(first["b64_json"])
             Image.open(BytesIO(img_bytes)).convert("RGB").save(save_path)
-            self.signals.api_test_finished.emit(f"生图 API 测试成功，已保存: {save_path}")
-            return
+            return f"生图 API 测试成功，已保存: {save_path}"
         raise RuntimeError(f"生图 API 返回数据异常: {list(first.keys())}")
 
 
@@ -336,6 +342,7 @@ class LicenseDialog(QDialog):
         self.config = config
         self.license_status = None
         self.setWindowTitle("ReCreate AI 授权验证")
+        self.setWindowIcon(load_app_icon())
         self.setModal(True)
         self.setMinimumWidth(720)
         self.resize(760, 360)
@@ -603,6 +610,8 @@ class MainWindow(QMainWindow):
         self.model_fetch_thread: ModelFetchThread | None = None
         self.queue_dialog: UploadQueueDialog | None = None
         self.pending_sources: list[str] = []  # 待处理的文件夹队列
+        self.upload_batch_task_ids: set[str] = set()
+        self.upload_batch_active = False
         self.upload_timer = QTimer(self)
         self.upload_timer.setSingleShot(True)
         self.upload_timer.timeout.connect(self.run_next_if_idle)
@@ -617,11 +626,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1380, 840)
         self.setStyleSheet(APP_STYLE)
 
-        # 设置应用图标
-        icon_path = PROJECT_DIR / "app_icon.png"
-        if icon_path.exists():
-            from PyQt5.QtGui import QIcon
-            self.setWindowIcon(QIcon(str(icon_path)))
+        self.setWindowIcon(load_app_icon())
 
         central = QWidget()
         central.setObjectName("page")
@@ -793,7 +798,7 @@ class MainWindow(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
         action_row.addWidget(self.progress_bar, stretch=1)
-        self.btn_generate = QPushButton("开始批量生成并上传")
+        self.btn_generate = QPushButton("开始批量生成成品")
         self.btn_generate.setObjectName("primaryButton")
         self.btn_generate.clicked.connect(self.start_batch_generation)
         action_row.addWidget(self.btn_generate)
@@ -865,9 +870,15 @@ class MainWindow(QMainWindow):
         upload_status_row.addWidget(btn_view_queue)
         upload_layout.addLayout(upload_status_row)
 
-        run_next_btn = QPushButton("上传队列下一条")
-        run_next_btn.clicked.connect(self.run_next_if_idle)
-        upload_layout.addWidget(run_next_btn)
+        self.btn_import_finished = QPushButton("导入已生成成品")
+        self.btn_import_finished.setObjectName("secondaryButton")
+        self.btn_import_finished.clicked.connect(self.add_finished_folders_to_queue)
+        upload_layout.addWidget(self.btn_import_finished)
+
+        self.btn_start_upload = QPushButton("开始上传队列")
+        self.btn_start_upload.setObjectName("primaryButton")
+        self.btn_start_upload.clicked.connect(self.run_next_if_idle)
+        upload_layout.addWidget(self.btn_start_upload)
 
         log_title = QLabel("运行日志")
         log_title.setObjectName("sectionTitle")
@@ -941,6 +952,47 @@ class MainWindow(QMainWindow):
         for item in self.source_list.selectedItems():
             self.source_list.takeItem(self.source_list.row(item))
 
+    def add_finished_folders_to_queue(self) -> None:
+        """导入已生成的成品文件夹，直接加入上传队列，不再转码。"""
+        folder = QFileDialog.getExistingDirectory(
+            self, "选择已生成成品文件夹或父目录", str(SUCAI_DIR),
+        )
+        if not folder:
+            return
+        self.save_defaults()
+        root = Path(folder)
+        candidates = [root]
+        if not self._try_add_finished_folder(root, silent=True):
+            candidates = [p for p in sorted(root.iterdir()) if p.is_dir()]
+
+        added = 0
+        errors: list[str] = []
+        for candidate in candidates:
+            try:
+                task = build_task_from_folder(candidate, **self.current_task_args())
+                task = self.store.add(task)
+                added += 1
+                self.append_log(f"已导入上传队列: {task.drama_name} <- {candidate.name}")
+            except Exception as exc:
+                errors.append(f"{candidate.name}: {exc}")
+
+        self.refresh_table()
+        if added:
+            self.append_log(f"已导入 {added} 个成品文件夹，可点击“开始上传队列”上传")
+        else:
+            self.append_log("没有导入任何成品文件夹，请确认目录内包含视频、海报、简介/剧名等成品文件")
+            if errors:
+                self.append_log("导入失败示例: " + errors[0])
+
+    def _try_add_finished_folder(self, folder: Path, silent: bool = False) -> bool:
+        try:
+            build_task_from_folder(folder, **self.current_task_args())
+            return True
+        except Exception as exc:
+            if not silent:
+                self.append_log(f"成品文件夹识别失败: {folder} / {exc}")
+            return False
+
     # ---- 文件选择对话框 ----
 
     def choose_docx_template(self) -> None:
@@ -996,7 +1048,7 @@ class MainWindow(QMainWindow):
         try:
             from .generation_pipeline import validate_generation_inputs
 
-            input_errors = validate_generation_inputs(self.pending_sources)
+            input_errors = validate_generation_inputs(self.pending_sources, self.config)
         except Exception as exc:
             self.append_log(f"导入生成模块失败: {exc}")
             QMessageBox.critical(self, "错误", f"加载生成模块失败:\n{exc}")
@@ -1011,6 +1063,8 @@ class MainWindow(QMainWindow):
         self.source_list.clear()
         self.progress_bar.setValue(0)
         self.btn_generate.setEnabled(False)
+        self.btn_start_upload.setEnabled(False)
+        self.btn_import_finished.setEnabled(False)
         self._check_image_api_status()
         self._process_next_source()
 
@@ -1144,13 +1198,15 @@ class MainWindow(QMainWindow):
         self._process_next_source()
 
     def on_all_generation_done(self) -> None:
-        """所有文件夹处理完毕 → 自动开始上传。"""
+        """所有文件夹处理完毕，等待用户手动开始上传。"""
         self.btn_generate.setEnabled(True)
+        self.btn_start_upload.setEnabled(True)
+        self.btn_import_finished.setEnabled(True)
         self.progress_bar.setValue(100)
         pending_count = sum(1 for t in self.store.load() if t.status == "pending")
-        self.append_log(f"全部生成完毕，队列中有 {pending_count} 个待上传任务")
+        self.append_log(f"全部生成完毕，队列中有 {pending_count} 个待上传任务。请点击“开始上传队列”后再提交到微信视频号。")
         if pending_count > 0:
-            self.run_next_if_idle()
+            self.update_upload_status()
 
     # ---- 扫码登录 ----
 
@@ -1169,17 +1225,73 @@ class MainWindow(QMainWindow):
         if self.upload_thread and self.upload_thread.is_alive():
             self.append_log("已有上传任务正在运行")
             return
-        if not self.store.next_pending():
+        if (self.generation_thread and self.generation_thread.is_alive()) or self.pending_sources:
+            self.append_log("素材仍在生成/转码中，请等待全部生成完成后再开始上传")
+            return
+        pending_tasks = [task for task in self.store.load() if task.status == "pending"]
+        if not pending_tasks:
             self.append_log("没有待上传任务")
+            self._finish_upload_batch_if_done()
             return
         if not self.ensure_license_or_warn():
             return
         self.save_defaults()
+        if not self.upload_batch_active:
+            self.upload_batch_task_ids = {task.id for task in pending_tasks}
+            self.upload_batch_active = True
+            self.btn_start_upload.setEnabled(False)
+            self.btn_import_finished.setEnabled(False)
+            self.append_log(f"开始本轮上传，共 {len(self.upload_batch_task_ids)} 个任务")
         self.upload_thread = UploadThread(self.signals)
         self.upload_thread.start()
         self.append_log("开始上传下一条任务")
         self.refresh_table()
         self.update_upload_status()
+
+    def _finish_upload_batch_if_done(self) -> None:
+        if not self.upload_batch_active:
+            return
+        batch_tasks = [task for task in self.store.load() if task.id in self.upload_batch_task_ids]
+        if any(task.status in {"pending", "uploading"} for task in batch_tasks):
+            return
+        report_path = self._write_upload_batch_report()
+        self.upload_batch_active = False
+        self.upload_batch_task_ids = set()
+        self.btn_start_upload.setEnabled(True)
+        self.btn_import_finished.setEnabled(True)
+        self.append_log(f"本轮上传结束，结果清单已保存: {report_path}")
+
+    def _write_upload_batch_report(self) -> Path:
+        tasks = [task for task in self.store.load() if task.id in self.upload_batch_task_ids]
+        failed = [task for task in tasks if task.status == "failed"]
+        success = [task for task in tasks if task.status == "success"]
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_path = SUCAI_DIR / f"上传结果清单_{timestamp}.txt"
+        lines = [
+            "上传结果清单",
+            f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"本轮任务数: {len(tasks)}",
+            f"成功: {len(success)}",
+            f"失败: {len(failed)}",
+            "",
+        ]
+        if failed:
+            lines.append("失败任务:")
+            for index, task in enumerate(failed, 1):
+                lines.extend([
+                    f"{index}. {task.drama_name}",
+                    f"   文件夹: {task.folder}",
+                    f"   错误: {task.last_error or '未知错误'}",
+                ])
+        else:
+            lines.append("失败任务: 无")
+        lines.append("")
+        lines.append("全部任务状态:")
+        for index, task in enumerate(tasks, 1):
+            lines.append(f"{index}. [{task.status}] {task.drama_name} | {task.folder}")
+        SUCAI_DIR.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("\n".join(lines), encoding="utf-8")
+        return report_path
 
     # ---- API 测试 ----
 
@@ -1391,6 +1503,8 @@ class MainWindow(QMainWindow):
             interval_min = self.spin_interval.value()
             self.append_log(f"等待 {interval_min} 分钟后上传下一条...")
             self.upload_timer.start(interval_min * 60 * 1000)
+        else:
+            self._finish_upload_batch_if_done()
         self.update_upload_status()
 
     def on_upload_failed(self, msg: str) -> None:
@@ -1402,6 +1516,8 @@ class MainWindow(QMainWindow):
             interval_min = self.spin_interval.value()
             self.append_log(f"等待 {interval_min} 分钟后上传下一条...")
             self.upload_timer.start(interval_min * 60 * 1000)
+        else:
+            self._finish_upload_batch_if_done()
         self.update_upload_status()
 
     def on_generation_progress(self, value: int, text: str) -> None:
@@ -1448,6 +1564,7 @@ class MainWindow(QMainWindow):
 def main() -> None:
     app = QApplication([])
     app.setFont(QFont("Microsoft YaHei UI", 10))
+    app.setWindowIcon(load_app_icon())
     config = load_config()
     if os.environ.get("RECREATE_AI_SMOKE_TEST") == "1":
         result_path = os.environ.get("RECREATE_AI_SMOKE_RESULT", "")

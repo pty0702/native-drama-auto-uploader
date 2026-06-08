@@ -22,7 +22,6 @@ from .settings import AppConfig, DEBUG_DIR, IMAGE_MODEL, SUCAI_DIR, TEXT_MODEL
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[int, str], None]
-REQUIRED_TEMPLATE_FILES = ("视频.docx", "模板.jpg")
 
 
 class DuplicateDramaNameSkipped(RuntimeError):
@@ -93,9 +92,17 @@ def convert_bmp_proofs(proof_src: list[Path], output_dir: Path, log: LogFn) -> l
     return results
 
 
-def validate_generation_inputs(sources: list[str | Path]) -> list[str]:
+def _configured_template_files(config: AppConfig | None = None) -> tuple[Path, Path]:
+    """返回当前配置里的成本模板 docx 和印章底图，未配置时使用 sucai 默认文件。"""
+    docx_template = Path(config.docx_template) if config and config.docx_template else SUCAI_DIR / "视频.docx"
+    stamp_image = Path(config.stamp_image) if config and config.stamp_image else SUCAI_DIR / "模板.jpg"
+    return docx_template, stamp_image
+
+
+def validate_generation_inputs(sources: list[str | Path], config: AppConfig | None = None) -> list[str]:
     """流水线启动前校验公共素材和每个视频包的必需文件。"""
     errors: list[str] = []
+    docx_template, stamp_image = _configured_template_files(config)
 
     for source in sources:
         source_path = Path(source)
@@ -109,10 +116,9 @@ def validate_generation_inputs(sources: list[str | Path]) -> list[str]:
         if not find_folder_named_cover(source_path):
             errors.append(f"视频包缺少海报图片，必须命名为 文件夹名.jpg/png/jpeg: {source_path}")
         if not find_source_cost_table(source_path):
-            for filename in REQUIRED_TEMPLATE_FILES:
-                path = SUCAI_DIR / filename
+            for label, path in (("成本模板 docx", docx_template), ("印章底图", stamp_image)):
                 if not path.exists() or not path.is_file():
-                    errors.append(f"缺少公共素材: {path}")
+                    errors.append(f"缺少{label}: {path}")
 
     return errors
 
@@ -347,8 +353,7 @@ def _run_pipeline(
         log(f"  已直接复用原素材成本表: {template_dst.name} <- {cost_table_src.name}")
         progress(90, "已复用原素材成本表")
     else:
-        docx_template = SUCAI_DIR / "视频.docx"
-        stamp_image = SUCAI_DIR / "模板.jpg"
+        docx_template, stamp_image = _configured_template_files(config)
         if docx_template.exists() and stamp_image.exists():
             generate_template_image(
                 docx_template,
