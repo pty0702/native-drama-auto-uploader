@@ -29,9 +29,10 @@ import os as _os
 shared_datas = [('app_icon.png', '.')]
 if _os.path.exists('app_icon.ico'):
     shared_datas.append(('app_icon.ico', '.'))
-for _src in ('sucai/视频.docx', 'sucai/模板.jpg'):
-    if _os.path.exists(_src):
-        shared_datas.append((_src, 'sucai'))
+# sucai 素材不再打包到发布包中
+# for _src in ('sucai/视频.docx', 'sucai/模板.jpg'):
+#     if _os.path.exists(_src):
+#         shared_datas.append((_src, 'sucai'))
 
 all_datas = shared_datas + playwright_datas + extra_datas
 

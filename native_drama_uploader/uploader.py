@@ -432,6 +432,7 @@ class WeChatNativeDramaUploader:
                 self.context = await self.browser.new_context(storage_state=self.config.account_state_path)
                 await self.context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
                 self.page = await self.context.new_page()
+                upload_failed = False
                 try:
                     log(f"开始上传任务: {task.drama_name} ({task.episode_count}集), 总超时: {overall_timeout}s")
                     await asyncio.wait_for(
@@ -442,13 +443,27 @@ class WeChatNativeDramaUploader:
                     if type(exc) is not asyncio.TimeoutError:
                         raise
                     log(f"上传任务总超时({overall_timeout}s)，强制结束")
+                    upload_failed = True
                     raise RuntimeError(f"上传任务超时({overall_timeout // 60}分钟)，请检查网络和页面状态")
                 except Exception as exc:
                     await save_error(self.page, "run_task", exc)
+                    upload_failed = True
                     raise
                 finally:
+                    # 失败时保留浏览器窗口，等待用户手动关闭（headless 模式除外）
+                    if upload_failed and not self.config.headless:
+                        try:
+                            if self.browser and self.browser.is_connected():
+                                log("上传步骤失败，浏览器窗口已保留，请手动处理。关闭浏览器窗口后程序将继续。")
+                                # 轮询等待用户手动关闭浏览器
+                                while self.browser.is_connected():
+                                    await asyncio.sleep(3)
+                                log("浏览器已由用户关闭，继续后续流程")
+                        except Exception as exc:
+                            log(f"等待浏览器关闭时出错: {exc}")
+
                     delay_sec = max(0, int(getattr(self.config, "close_delay_after_upload_sec", 0) or 0))
-                    if delay_sec > 0 and self.page is not None:
+                    if delay_sec > 0 and not upload_failed and self.page is not None:
                         try:
                             if not self.page.is_closed():
                                 log(f"上传流程已结束，窗口保留 {delay_sec} 秒后自动关闭")
@@ -460,7 +475,8 @@ class WeChatNativeDramaUploader:
                     except Exception:
                         pass
                     try:
-                        await self.browser.close()
+                        if self.browser and self.browser.is_connected():
+                            await self.browser.close()
                     except Exception:
                         pass
         except Exception as exc:
