@@ -455,10 +455,14 @@ class WeChatNativeDramaUploader:
                         try:
                             if self.browser and self.browser.is_connected():
                                 log("上传步骤失败，浏览器窗口已保留，请手动处理。关闭浏览器窗口后程序将继续。")
-                                # 轮询等待用户手动关闭浏览器
-                                while self.browser.is_connected():
+                                # 轮询等待用户手动关闭浏览器，最多等 30 分钟防止无限挂起
+                                poll_deadline = asyncio.get_event_loop().time() + 1800
+                                while self.browser.is_connected() and asyncio.get_event_loop().time() < poll_deadline:
                                     await asyncio.sleep(3)
-                                log("浏览器已由用户关闭，继续后续流程")
+                                if self.browser.is_connected():
+                                    log("等待浏览器关闭超时（30分钟），强制继续")
+                                else:
+                                    log("浏览器已由用户关闭，继续后续流程")
                         except Exception as exc:
                             log(f"等待浏览器关闭时出错: {exc}")
 
@@ -470,15 +474,16 @@ class WeChatNativeDramaUploader:
                                 await self.page.wait_for_timeout(delay_sec * 1000)
                         except Exception as exc:
                             log(f"关闭前等待失败: {exc}")
+                    # 清理 context 和 browser — 加 timeout 防止浏览器已关闭时无限挂起
                     try:
-                        await self.context.close()
-                    except Exception:
-                        pass
+                        await asyncio.wait_for(self.context.close(), timeout=10)
+                    except Exception as exc:
+                        log(f"context 关闭失败（可忽略）: {exc}")
                     try:
                         if self.browser and self.browser.is_connected():
-                            await self.browser.close()
-                    except Exception:
-                        pass
+                            await asyncio.wait_for(self.browser.close(), timeout=10)
+                    except Exception as exc:
+                        log(f"browser 关闭失败（可忽略）: {exc}")
         except Exception as exc:
             # 确保异常信息清晰，给出排查建议
             error_msg = str(exc)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -134,15 +135,19 @@ class UploadThread(threading.Thread):
     def __init__(self, signals: Signals) -> None:
         super().__init__(daemon=True)
         self.signals = signals
+        self._start_time = time.monotonic()
+        self._cancelled = False
 
     def run(self) -> None:
         try:
             asyncio.run(run_next_task(dry_run=False))
-            self.signals.upload_finished.emit("上传任务完成")
+            if not self._cancelled:
+                self.signals.upload_finished.emit("上传任务完成")
         except Exception as exc:
-            import traceback
-            error_detail = f"{exc}\n\n{traceback.format_exc()}"
-            self.signals.upload_failed.emit(error_detail)
+            if not self._cancelled:
+                import traceback
+                error_detail = f"{exc}\n\n{traceback.format_exc()}"
+                self.signals.upload_failed.emit(error_detail)
 
 
 class LoginThread(threading.Thread):
@@ -1223,8 +1228,17 @@ class MainWindow(QMainWindow):
 
     def run_next_if_idle(self) -> None:
         if self.upload_thread and self.upload_thread.is_alive():
-            self.append_log("已有上传任务正在运行")
-            return
+            # 检测卡死线程：存活超过上传超时+15分钟缓冲 → 视为卡死，允许重新上传
+            alive_sec = time.monotonic() - getattr(self.upload_thread, '_start_time', 0)
+            max_alive = self.config.upload_timeout_min * 60 + 900
+            if alive_sec > max_alive:
+                self.append_log("⚠ 上传线程超时未响应，已视为卡死，启动新上传")
+                self.upload_thread._cancelled = True
+                self.upload_batch_active = False
+                self.upload_batch_task_ids = set()
+            else:
+                self.append_log("已有上传任务正在运行")
+                return
         if (self.generation_thread and self.generation_thread.is_alive()) or self.pending_sources:
             self.append_log("素材仍在生成/转码中，请等待全部生成完成后再开始上传")
             return

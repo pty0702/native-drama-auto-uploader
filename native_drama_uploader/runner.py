@@ -53,6 +53,11 @@ async def run_next_task(dry_run: bool = False) -> None:
         print(f"开始上传: {task.drama_name} ({task.episode_count}集)")
         print(f"登录态: {account_path}")
 
+        # 检查视频分辨率，720p 自动放大到 1080p
+        from core.video_processor import upscale_if_needed
+        task.video_files = upscale_if_needed(task.video_files, log_cb=print)
+        store.update(task.id, video_files=task.video_files)
+
         from .uploader import WeChatNativeDramaUploader
 
         uploader = WeChatNativeDramaUploader(config)

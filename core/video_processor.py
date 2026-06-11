@@ -433,3 +433,95 @@ def _format_duration_for_log(seconds):
 
 def _extract_episode(filename):
     return extract_episode_number(filename)
+
+
+# ---------------------------------------------------------------------------
+# 视频分辨率检测 & 上传前 720p→1080p 放大
+# ---------------------------------------------------------------------------
+
+def get_video_resolution(path: str) -> tuple[int, int]:
+    """用 ffprobe 获取视频分辨率，返回 (width, height)。失败返回 (0, 0)。"""
+    try:
+        ffprobe = _get_ffprobe()
+    except FileNotFoundError:
+        return (0, 0)
+    try:
+        r = subprocess.run(
+            [
+                ffprobe, "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=p=0",
+                path,
+            ],
+            capture_output=True, text=True, timeout=10,
+            **_subprocess_no_window(),
+        )
+        parts = r.stdout.strip().split(",")
+        if len(parts) >= 2:
+            return (int(parts[0]), int(parts[1]))
+    except Exception:
+        pass
+    return (0, 0)
+
+
+def upscale_if_needed(video_files: list[str], log_cb=None) -> list[str]:
+    """检查视频列表，高度 < 1080 的放大到 1080p，1080p 及以上不动。
+
+    返回可能更新后的文件路径列表（720p 文件被原地替换）。
+    """
+    def log(msg):
+        if log_cb:
+            log_cb(msg)
+
+    result = []
+    for vf in video_files:
+        width, height = get_video_resolution(vf)
+        if height == 0:
+            log(f"  无法读取分辨率，跳过: {os.path.basename(vf)}")
+            result.append(vf)
+            continue
+
+        if height >= 1080:
+            log(f"  {os.path.basename(vf)}: {width}x{height}，无需放大")
+            result.append(vf)
+            continue
+
+        log(f"  {os.path.basename(vf)}: {width}x{height}，正在放大到 1080p...")
+        try:
+            ffmpeg = _get_ffmpeg()
+        except FileNotFoundError:
+            log(f"  找不到 ffmpeg，跳过放大")
+            result.append(vf)
+            continue
+
+        # 输出到临时文件，成功后替换原文件
+        tmp_path = vf + ".upscaling.mp4"
+        cmd = [
+            ffmpeg, "-y", "-i", vf,
+            "-vf", "scale=-2:1080:flags=lanczos",
+            "-c:v", "libx264", "-preset", "ultrafast",
+            "-b:v", "6000k", "-maxrate", "6000k", "-bufsize", "12000k",
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            tmp_path,
+        ]
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=600, check=True,
+                           **_subprocess_no_window())
+            # 用临时文件替换原文件
+            shutil.move(tmp_path, vf)
+            new_w, new_h = get_video_resolution(vf)
+            log(f"  放大完成: {new_w}x{new_h}")
+        except subprocess.CalledProcessError as exc:
+            log(f"  放大失败: {exc.stderr[:200] if exc.stderr else exc}")
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception as exc:
+            log(f"  放大失败: {exc}")
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+        result.append(vf)
+
+    return result
