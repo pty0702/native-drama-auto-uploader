@@ -94,8 +94,65 @@
    - 1080p 视频不被动
 2. **git commit**: 提交所有变更
 
-## 10. 新窗口第一条提示词
+## 10. 固定打包交付逻辑（下次用户说“打包”就按这个做）
+
+### 目标产物
+- Windows 免安装目录：`dist/ReCreate AI/`
+- ZIP 交付包：`dist/ReCreate_AI_portable.zip`
+- 交付包应包含：主程序 `ReCreate AI.exe`、`_internal/` 依赖、`ffmpeg/bin/ffmpeg.exe` 和 `ffmpeg/bin/ffprobe.exe`
+- 交付包不包含：`.venv/`、`build/`、`db/`、`cookies/`、`debug/`、`log/`、`sucai` 素材目录、历史 release 目录、源码工作区杂项
+
+### 打包前检查
+1. 确认依赖可用：
+   ```bash
+   python -c "import sys; print(sys.executable)"
+   python -c "import PyQt5; print('PyQt5 ok')"
+   python -c "import patchright; print('patchright ok')"
+   python -c "import openai; print('openai ok')"
+   ```
+2. 确认 `ffmpeg/bin/` 下有 `ffmpeg.exe`、`ffprobe.exe`（以及需要的 DLL）。
+3. 确认 `ReCreate AI.spec` 里：
+   - `playwright` 和 `patchright` 都收集；
+   - `sucai/视频.docx`、`sucai/模板.jpg` 仍保持注释，不打入发布包；
+   - `ffmpeg/bin` 的 exe/dll 通过 `binaries` 打入包。
+
+### 打包命令
+```bash
+python -m PyInstaller "ReCreate AI.spec" --noconfirm --clean
+```
+
+### 生成 ZIP 的标准逻辑
+PyInstaller 成功后，以 `dist/ReCreate AI/` 目录为根打包成 `dist/ReCreate_AI_portable.zip`，ZIP 内第一层必须是 `ReCreate AI/` 目录，不能只把内部文件散放到 ZIP 根目录。推荐用 Python 脚本生成，避免 Windows shell 编码/路径问题：
+
+```bash
+python - <<'PY'
+from pathlib import Path
+import zipfile
+
+root = Path('dist/ReCreate AI')
+out = Path('dist/ReCreate_AI_portable.zip')
+if out.exists():
+    out.unlink()
+with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as zf:
+    for p in root.rglob('*'):
+        if p.is_file():
+            zf.write(p, p.relative_to(root.parent))
+print(out, out.stat().st_size)
+PY
+```
+
+### 打包后验证
+1. 确认 `dist/ReCreate_AI_portable.zip` 存在且大小正常（上次约 294MB）。
+2. 检查 ZIP 内容至少包含：
+   - `ReCreate AI/ReCreate AI.exe`
+   - `ReCreate AI/_internal/...`
+   - `ReCreate AI/ffmpeg/bin/ffmpeg.exe`
+   - `ReCreate AI/ffmpeg/bin/ffprobe.exe`
+3. 如果环境允许，运行 `dist/ReCreate AI/ReCreate AI.exe` 做冒烟验证。
+4. `dist/` 和 ZIP 产物被 `.gitignore` 忽略，不提交到 Git；只提交源码、spec、文档等变更。
+
+## 11. 新窗口第一条提示词
 
 ```
-读 HANDOFF.md 接手。当前所有功能开发已完成，打包产物在 dist/ReCreate_AI_portable.zip（294MB）。请帮我 git commit 所有变更。
+读 HANDOFF.md 接手。当前所有功能开发已完成，打包逻辑见 HANDOFF.md 第 10 节；交付产物标准路径是 dist/ReCreate_AI_portable.zip。请先检查 git status，再按需要 commit/push。
 ```

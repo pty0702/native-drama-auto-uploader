@@ -143,7 +143,9 @@ class UploadThread(threading.Thread):
             asyncio.run(run_next_task(dry_run=False))
             if not self._cancelled:
                 self.signals.upload_finished.emit("上传任务完成")
-        except Exception as exc:
+        except BaseException as exc:
+            # Catch BaseException (包括 SystemExit 等) 以确保始终发出信号，
+            # 避免 GUI 按钮永久禁用。对 daemon 线程来说 re-raise 没有实际意义。
             if not self._cancelled:
                 import traceback
                 error_detail = f"{exc}\n\n{traceback.format_exc()}"
@@ -620,6 +622,10 @@ class MainWindow(QMainWindow):
         self.upload_timer = QTimer(self)
         self.upload_timer.setSingleShot(True)
         self.upload_timer.timeout.connect(self.run_next_if_idle)
+        # 看门狗：定期检测上传线程是否异常退出（未发出信号），防止按钮永久禁用
+        self.upload_watchdog = QTimer(self)
+        self.upload_watchdog.setInterval(15000)
+        self.upload_watchdog.timeout.connect(self._watchdog_check)
         self.init_ui()
         self.refresh_table()
         self.refresh_gpu_status()
@@ -1226,7 +1232,26 @@ class MainWindow(QMainWindow):
 
     # ---- 上传 ----
 
+    def _recover_dead_batch(self, reason: str) -> None:
+        """上传线程异常退出时，将卡在 uploading 的任务标记为 failed，
+        重置批次状态并恢复按钮。pending 任务保持不变，下次可重新入队。"""
+        self.append_log(f"⚠ {reason}")
+        for task in self.store.load():
+            if task.id in self.upload_batch_task_ids and task.status == "uploading":
+                self.store.update(task.id, status="failed", last_error=reason)
+        self.upload_batch_active = False
+        self.upload_batch_task_ids = set()
+        self.upload_watchdog.stop()
+        self.btn_start_upload.setEnabled(True)
+        self.btn_import_finished.setEnabled(True)
+
     def run_next_if_idle(self) -> None:
+        # 恢复机制：上传线程已死但批次仍 active（线程崩溃未发出信号），
+        # 重置批次后返回，让用户看到恢复信息后再手动点击重新上传。
+        if self.upload_batch_active and (not self.upload_thread or not self.upload_thread.is_alive()):
+            self._recover_dead_batch("检测到上传线程已退出但批次未完成，已恢复。请重新点击「开始上传队列」。")
+            return
+
         if self.upload_thread and self.upload_thread.is_alive():
             # 检测卡死线程：存活超过上传超时+15分钟缓冲 → 视为卡死，允许重新上传
             alive_sec = time.monotonic() - getattr(self.upload_thread, '_start_time', 0)
@@ -1234,8 +1259,15 @@ class MainWindow(QMainWindow):
             if alive_sec > max_alive:
                 self.append_log("⚠ 上传线程超时未响应，已视为卡死，启动新上传")
                 self.upload_thread._cancelled = True
+                # 将卡在上传中的任务标记为失败，停止看门狗
+                for task in self.store.load():
+                    if task.id in self.upload_batch_task_ids and task.status == "uploading":
+                        self.store.update(task.id, status="failed", last_error="上传线程卡死超时")
                 self.upload_batch_active = False
                 self.upload_batch_task_ids = set()
+                self.upload_watchdog.stop()
+                self.btn_start_upload.setEnabled(True)
+                self.btn_import_finished.setEnabled(True)
             else:
                 self.append_log("已有上传任务正在运行")
                 return
@@ -1258,6 +1290,7 @@ class MainWindow(QMainWindow):
             self.append_log(f"开始本轮上传，共 {len(self.upload_batch_task_ids)} 个任务")
         self.upload_thread = UploadThread(self.signals)
         self.upload_thread.start()
+        self.upload_watchdog.start()  # 启动看门狗
         self.append_log("开始上传下一条任务")
         self.refresh_table()
         self.update_upload_status()
@@ -1268,12 +1301,16 @@ class MainWindow(QMainWindow):
         batch_tasks = [task for task in self.store.load() if task.id in self.upload_batch_task_ids]
         if any(task.status in {"pending", "uploading"} for task in batch_tasks):
             return
-        report_path = self._write_upload_batch_report()
+        try:
+            report_path = self._write_upload_batch_report()
+            self.append_log(f"本轮上传结束，结果清单已保存: {report_path}")
+        except Exception as exc:
+            self.append_log(f"上传结果清单保存失败（不影响上传结果）: {exc}")
         self.upload_batch_active = False
         self.upload_batch_task_ids = set()
+        self.upload_watchdog.stop()  # 批次结束，停止看门狗
         self.btn_start_upload.setEnabled(True)
         self.btn_import_finished.setEnabled(True)
-        self.append_log(f"本轮上传结束，结果清单已保存: {report_path}")
 
     def _write_upload_batch_report(self) -> Path:
         tasks = [task for task in self.store.load() if task.id in self.upload_batch_task_ids]
@@ -1533,6 +1570,19 @@ class MainWindow(QMainWindow):
         else:
             self._finish_upload_batch_if_done()
         self.update_upload_status()
+
+    def _watchdog_check(self) -> None:
+        """定期检查上传线程是否异常退出，防止按钮永久禁用。"""
+        if not self.upload_batch_active:
+            self.upload_watchdog.stop()
+            return
+        # 线程还活着或在等间隔 → 正常，不干预
+        if self.upload_thread and self.upload_thread.is_alive():
+            return
+        if self.upload_timer.isActive():
+            return
+        # 线程已死、定时器未启动、批次仍 active → 线程崩溃未发出信号
+        self._recover_dead_batch("看门狗检测到上传线程异常退出，已自动恢复。")
 
     def on_generation_progress(self, value: int, text: str) -> None:
         self.progress_bar.setValue(value)
